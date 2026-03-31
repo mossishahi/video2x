@@ -440,6 +440,16 @@ def start_job(job_id):
     if "gpu" in data:
         job["gpu"] = data["gpu"]
 
+    # Store password for this session if provided
+    if data.get("password"):
+        configs = load_gpu_configs()
+        try:
+            gpu_idx = int(data.get("gpu", ""))
+            if 0 <= gpu_idx < len(configs):
+                gpu_passwords[_gpu_key(configs[gpu_idx])] = data["password"]
+        except (ValueError, IndexError):
+            pass
+
     job["output_dir"] = output_dir or os.path.dirname(job["input"])
     job["output"] = generate_output_path(job["input"], job["output_dir"])
 
@@ -1390,10 +1400,27 @@ function startJob(jobId) {
   var gpu = 'local';
   var sel = document.getElementById('gpu-' + jobId);
   if (sel) gpu = sel.value;
+
+  var needsPassword = false;
+  if (gpu !== 'local') {
+    for (var i = 0; i < gpuConfigs.length; i++) {
+      if (String(gpuConfigs[i].id) === String(gpu) && gpuConfigs[i].auth === 'password') {
+        needsPassword = true;
+        break;
+      }
+    }
+  }
+
+  var pw = '';
+  if (needsPassword) {
+    pw = prompt('Enter SSH password for ' + (gpuConfigs[parseInt(gpu)] ? gpuConfigs[parseInt(gpu)].name : 'remote GPU') + ':');
+    if (pw === null) return;
+  }
+
   fetch('/api/jobs/' + jobId + '/start', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({gpu: gpu})
+    body: JSON.stringify({gpu: gpu, password: pw})
   });
   lastJobIds = '';
 }
