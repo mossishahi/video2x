@@ -109,14 +109,31 @@ mkdir -p "$V2X_DIR/data"
 # Download the prebuilt AppImage (~50MB, works on any Linux x86_64)
 echo "Downloading prebuilt binary..."
 RELEASE_URL="https://github.com/k4yt3x/video2x/releases/download/6.4.0/Video2X-x86_64.AppImage"
-curl -sL "$RELEASE_URL" -o "$APPIMAGE" 2>&1 || wget -q "$RELEASE_URL" -O "$APPIMAGE" 2>&1
+
+if command -v curl &>/dev/null; then
+    curl -fSL --retry 3 "$RELEASE_URL" -o "$APPIMAGE" 2>&1
+elif command -v wget &>/dev/null; then
+    wget --tries=3 "$RELEASE_URL" -O "$APPIMAGE" 2>&1
+else
+    echo "INSTALL_FAILED: Neither curl nor wget available"
+    exit 1
+fi
+
+# Verify it actually downloaded (not an HTML error page)
+FILE_SIZE=$(stat -c%s "$APPIMAGE" 2>/dev/null || stat -f%z "$APPIMAGE" 2>/dev/null || echo 0)
+echo "Downloaded: ${FILE_SIZE} bytes"
+if [ "$FILE_SIZE" -lt 1000000 ]; then
+    echo "INSTALL_FAILED: Download too small (${FILE_SIZE} bytes), likely failed"
+    cat "$APPIMAGE" 2>/dev/null | head -5
+    exit 1
+fi
 
 chmod +x "$APPIMAGE"
 
 # Extract the AppImage (works even without FUSE, which many clusters lack)
 echo "Extracting..."
 cd "$V2X_DIR"
-"$APPIMAGE" --appimage-extract >/dev/null 2>&1 || true
+"$APPIMAGE" --appimage-extract 2>&1
 
 # Create a wrapper that runs the extracted binary
 if [ -d "$V2X_DIR/squashfs-root" ]; then
@@ -321,8 +338,8 @@ class RemoteGPU:
     def install_video2x(self):
         """Install processing engine on the remote machine if not present."""
         self._log("Checking remote installation...")
-        script = INSTALL_SCRIPT.format(v2x_dir=REMOTE_V2X_DIR)
-        _, stdout, stderr = self.ssh.exec_command(f"bash -l -c '{_escape(script)}'", get_pty=True)
+        script = INSTALL_SCRIPT.replace("{v2x_dir}", REMOTE_V2X_DIR)
+        _, stdout, stderr = self.ssh.exec_command(f"bash -l <<'VENHANCE_EOF'\n{script}\nVENHANCE_EOF", get_pty=True)
 
         for line in stdout:
             line = line.strip()
