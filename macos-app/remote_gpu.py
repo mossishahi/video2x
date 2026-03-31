@@ -216,7 +216,21 @@ class RemoteGPU:
             if sock:
                 kwargs["sock"] = sock
             kwargs.update(_auth_kwargs(auth, password, key_path))
-            self.ssh.connect(**kwargs)
+
+            try:
+                self.ssh.connect(**kwargs)
+            except paramiko.ssh_exception.BadAuthenticationType as e:
+                allowed = e.allowed_types if hasattr(e, 'allowed_types') else []
+                self._log(f"Retrying with allowed types: {allowed}")
+                transport = paramiko.Transport(sock if sock else (host, port))
+                transport.connect(username=username)
+                if "keyboard-interactive" in allowed and password:
+                    transport.auth_interactive(username, lambda *a: [password])
+                elif "publickey" in allowed:
+                    transport.auth_publickey(username, paramiko.Agent().get_keys()[0])
+                self.ssh = paramiko.SSHClient()
+                self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                self.ssh._transport = transport
             self.connected = True
             self._log(f"Connected to {username}@{host}")
 
