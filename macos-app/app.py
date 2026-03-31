@@ -7,6 +7,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import webview
@@ -24,83 +25,36 @@ V2X_ENV = {
     "VK_ICD_FILENAMES": "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
     "DYLD_LIBRARY_PATH": f"{V2X_DIR}/build:{V2X_DIR}/build/video2x-install/lib:/opt/homebrew/lib",
 }
-
-state = {
-    "status": "idle",
-    "frame": 0,
-    "total": 0,
-    "fps": 0.0,
-    "elapsed": "00:00:00",
-    "remaining": "--:--:--",
-    "progress": 0.0,
-    "log": "",
-    "devices": [],
-    "gpu_util": 0,
-    "gpu_render": 0,
-    "gpu_tiler": 0,
-}
-process_handle = None
-gpu_poll_active = False
-remote_gpu = RemoteGPU(state)
 PROGRESS_RE = re.compile(
     r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
 )
 
-
-def poll_gpu_utilization():
-    """Poll Apple Silicon GPU utilization via ioreg while processing."""
-    global gpu_poll_active
-    gpu_poll_active = True
-    while gpu_poll_active and state["status"] in ("running", "cancelling"):
-        try:
-            result = subprocess.run(
-                ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
-                capture_output=True, text=True, timeout=3
-            )
-            text = result.stdout
-            for key, field in [("gpu_util", "Device Utilization"), ("gpu_render", "Renderer Utilization"), ("gpu_tiler", "Tiler Utilization")]:
-                m = re.search(rf'"{field} %"=(\d+)', text)
-                if m:
-                    state[key] = int(m.group(1))
-        except Exception:
-            pass
-        time.sleep(1.5)
-    state["gpu_util"] = 0
-    state["gpu_render"] = 0
-    state["gpu_tiler"] = 0
-    gpu_poll_active = False
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+jobs = {}               # job_id -> job dict
+output_dir = ""         # global output directory
+devices = []            # detected local GPU devices
+gpu_util_data = {"gpu_util": 0, "gpu_render": 0, "gpu_tiler": 0}
+active_processes = {}   # job_id -> {"type": "local"/"remote", "proc"/"rgpu": handle}
+gpu_poll_active = False
+gpu_passwords = {}      # "user@host:port" -> password (in-memory only)
 
 
-def detect_devices():
-    try:
-        result = subprocess.run(
-            [str(V2X_BIN), "--list-devices"],
-            capture_output=True, text=True, env=V2X_ENV, timeout=10
-        )
-        devices = []
-        lines = result.stdout.strip().split("\n")
-        idx, name, dtype = -1, "", ""
-        for line in lines:
-            m = re.match(r"^(\d+)\.\s+(.+)$", line.strip())
-            if m:
-                if idx >= 0:
-                    devices.append({"id": idx, "name": name, "type": dtype})
-                idx, name, dtype = int(m.group(1)), m.group(2), ""
-            elif line.strip().startswith("Type:"):
-                dtype = line.strip()[5:].strip()
-        if idx >= 0:
-            devices.append({"id": idx, "name": name, "type": dtype})
-        state["devices"] = devices
-    except Exception as e:
-        state["log"] += f"Device detection failed: {e}\n"
+def _gpu_key(cfg):
+    return f"{cfg.get('user', '')}@{cfg.get('host', '')}:{cfg.get('port', 22)}"
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def probe_video(path):
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", "-show_format", path],
-            capture_output=True, text=True, timeout=10, env=V2X_ENV
+            capture_output=True, text=True, timeout=10, env=V2X_ENV,
         )
         data = json.loads(result.stdout)
         fmt = data.get("format", {})
@@ -120,21 +74,136 @@ def probe_video(path):
     return {}
 
 
-def run_processing(args):
-    global process_handle
-    state["status"] = "running"
-    state["frame"] = 0
-    state["total"] = 0
-    state["fps"] = 0.0
-    state["progress"] = 0.0
-    state["elapsed"] = "00:00:00"
-    state["remaining"] = "--:--:--"
-    state["log"] = f"$ video2x {' '.join(args)}\n"
+def format_info(info):
+    if not info or not info.get("width"):
+        return ""
+    fps = info.get("fps", "?")
+    if isinstance(fps, str) and "/" in fps:
+        try:
+            n, d = fps.split("/")
+            fps = round(int(n) / int(d), 1)
+        except (ValueError, ZeroDivisionError):
+            pass
+    return f"{info['width']}x{info['height']} | {fps}fps | {info.get('duration', '?')}s"
 
-    # video2x looks for models/ relative to cwd
-    models_dir = Path(os.path.dirname(os.path.abspath(__file__)))
-    if not (models_dir / "models").is_dir():
-        models_dir = V2X_DIR / "build" / "video2x-install" / "share" / "video2x"
+
+def detect_devices():
+    global devices
+    try:
+        result = subprocess.run(
+            [str(V2X_BIN), "--list-devices"],
+            capture_output=True, text=True, env=V2X_ENV, timeout=10,
+        )
+        devs = []
+        lines = result.stdout.strip().split("\n")
+        idx, name, dtype = -1, "", ""
+        for line in lines:
+            m = re.match(r"^(\d+)\.\s+(.+)$", line.strip())
+            if m:
+                if idx >= 0:
+                    devs.append({"id": idx, "name": name, "type": dtype})
+                idx, name, dtype = int(m.group(1)), m.group(2), ""
+            elif line.strip().startswith("Type:"):
+                dtype = line.strip()[5:].strip()
+        if idx >= 0:
+            devs.append({"id": idx, "name": name, "type": dtype})
+        devices = devs
+    except Exception:
+        pass
+
+
+def poll_gpu_utilization():
+    global gpu_poll_active
+    gpu_poll_active = True
+    while gpu_poll_active:
+        has_local = any(
+            j["status"] == "running" and j["gpu"] == "local"
+            for j in jobs.values()
+        )
+        if not has_local:
+            break
+        try:
+            result = subprocess.run(
+                ["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"],
+                capture_output=True, text=True, timeout=3,
+            )
+            text = result.stdout
+            for key, field in [
+                ("gpu_util", "Device Utilization"),
+                ("gpu_render", "Renderer Utilization"),
+                ("gpu_tiler", "Tiler Utilization"),
+            ]:
+                m = re.search(rf'"{field} %"=(\d+)', text)
+                if m:
+                    gpu_util_data[key] = int(m.group(1))
+        except Exception:
+            pass
+        time.sleep(1.5)
+    gpu_util_data.update(gpu_util=0, gpu_render=0, gpu_tiler=0)
+    gpu_poll_active = False
+
+
+def generate_output_path(input_path, out_dir):
+    name, ext = os.path.splitext(os.path.basename(input_path))
+    directory = out_dir if out_dir else os.path.dirname(input_path)
+    return os.path.join(directory, name + "_upscaled" + ext)
+
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+
+def build_v2x_args(job):
+    args = [
+        "-i", job["input"], "-o", job["output"],
+        "-p", job["processor"], "-d", "0",
+        "-c", job["codec"], "--log-level", "info",
+    ]
+    p = job["processor"]
+    if p in ("realesrgan", "realcugan"):
+        args += ["-s", str(job.get("scale", 4))]
+        flag = "--realesrgan-model" if p == "realesrgan" else "--realcugan-model"
+        args += [flag, job.get("model", "realesr-animevideov3")]
+    elif p == "libplacebo":
+        args += ["-w", str(job.get("width", 3840)), "-h", str(job.get("height", 2160))]
+        args += ["--libplacebo-shader", job.get("model", "anime4k-v4-a")]
+    elif p == "rife":
+        args += ["-m", str(job.get("multiplier", 2))]
+        args += ["--rife-model", job.get("model", "rife-v4.6")]
+    return args
+
+
+def build_remote_args_str(job):
+    p = job["processor"]
+    parts = [f"-p {p}", "-d 0", f"-c {job.get('codec', 'libx264')}", "--log-level info"]
+    if p in ("realesrgan", "realcugan"):
+        parts.append(f"-s {job.get('scale', 4)}")
+        flag = "--realesrgan-model" if p == "realesrgan" else "--realcugan-model"
+        parts.append(f"{flag} {job.get('model', 'realesr-animevideov3')}")
+    elif p == "libplacebo":
+        parts.append(f"-w {job.get('width', 3840)} -h {job.get('height', 2160)}")
+        parts.append(f"--libplacebo-shader {job.get('model', 'anime4k-v4-a')}")
+    elif p == "rife":
+        parts.append(f"-m {job.get('multiplier', 2)}")
+        parts.append(f"--rife-model {job.get('model', 'rife-v4.6')}")
+    return " ".join(parts)
+
+
+def _reset_job_progress(job):
+    job.update(frame=0, total=0, fps=0.0, progress=0.0,
+               elapsed="00:00:00", remaining="--:--:--")
+
+
+def run_local_job(job):
+    global gpu_poll_active
+    job["status"] = "running"
+    _reset_job_progress(job)
+
+    args = build_v2x_args(job)
+    job["log"] = f"$ video2x {' '.join(args)}\n"
+
+    models_dir = V2X_DIR / "build" / "video2x-install" / "share" / "video2x"
+    os.makedirs(os.path.dirname(job["output"]), exist_ok=True)
 
     try:
         proc = subprocess.Popen(
@@ -143,7 +212,10 @@ def run_processing(args):
             env=V2X_ENV, bufsize=1, universal_newlines=True,
             cwd=str(models_dir),
         )
-        process_handle = proc
+        active_processes[job["id"]] = {"type": "local", "proc": proc}
+
+        if not gpu_poll_active:
+            threading.Thread(target=poll_gpu_utilization, daemon=True).start()
 
         for line in proc.stdout:
             clean = line.replace("\x1b[K", "").replace("\r", "").strip()
@@ -151,57 +223,128 @@ def run_processing(args):
                 continue
             m = PROGRESS_RE.search(clean)
             if m:
-                state["frame"] = int(m.group(1))
-                state["total"] = int(m.group(2))
-                state["fps"] = float(m.group(4))
-                state["elapsed"] = m.group(5)
-                state["remaining"] = m.group(6).strip()
-                if state["total"] > 0:
-                    state["progress"] = state["frame"] / state["total"]
+                job["frame"] = int(m.group(1))
+                job["total"] = int(m.group(2))
+                job["fps"] = float(m.group(4))
+                job["elapsed"] = m.group(5)
+                job["remaining"] = m.group(6).strip()
+                if job["total"] > 0:
+                    job["progress"] = job["frame"] / job["total"]
             else:
-                state["log"] += clean + "\n"
-                if len(state["log"]) > 50000:
-                    state["log"] = state["log"][-40000:]
+                job["log"] += clean + "\n"
+                if len(job["log"]) > 50000:
+                    job["log"] = job["log"][-40000:]
 
         proc.wait()
         if proc.returncode == 0:
-            state["status"] = "finished"
-            state["progress"] = 1.0
-            state["log"] += "\nProcessing completed successfully!\n"
+            job["status"] = "finished"
+            job["progress"] = 1.0
+            job["log"] += "\nProcessing completed successfully!\n"
         else:
-            state["status"] = "failed"
-            state["log"] += f"\nProcess exited with code {proc.returncode}\n"
+            job["status"] = "failed"
+            job["log"] += f"\nProcess exited with code {proc.returncode}\n"
     except Exception as e:
-        state["status"] = "failed"
-        state["log"] += f"\nError: {e}\n"
+        job["status"] = "failed"
+        job["log"] += f"\nError: {e}\n"
     finally:
-        process_handle = None
+        active_processes.pop(job["id"], None)
 
+
+def run_remote_job(job, gpu_config):
+    job["status"] = "running"
+    _reset_job_progress(job)
+    job["log"] = ""
+
+    rgpu = RemoteGPU(job)
+    active_processes[job["id"]] = {"type": "remote", "rgpu": rgpu}
+
+    slurm = gpu_config.get("slurm", {})
+    rgpu.slurm_opts = {
+        "partition": gpu_config.get("partition", slurm.get("partition", "")),
+        "gres": gpu_config.get("gres", slurm.get("gres", "gpu:1")),
+        "mem": gpu_config.get("mem", slurm.get("mem", "32G")),
+        "time": gpu_config.get("time_limit", slurm.get("time", "")),
+        "qos": gpu_config.get("qos", slurm.get("qos", "")),
+        "nice": gpu_config.get("nice", slurm.get("nice", "")),
+        "extra_sbatch": gpu_config.get("extra_sbatch", slurm.get("extra_sbatch", "")),
+    }
+    use_slurm = gpu_config.get("type", "direct") == "slurm"
+
+    pw = gpu_passwords.get(_gpu_key(gpu_config))
+
+    try:
+        ok = rgpu.connect(
+            host=gpu_config["host"],
+            username=gpu_config.get("user", ""),
+            password=pw,
+            key_path=gpu_config.get("key_path"),
+            port=int(gpu_config.get("port", 22)),
+            proxy=gpu_config.get("proxy"),
+            auth=gpu_config.get("auth", "key"),
+        )
+        if not ok:
+            job["status"] = "failed"
+            return
+
+        if not rgpu.install_video2x():
+            job["status"] = "failed"
+            rgpu.disconnect()
+            return
+
+        remote_path = rgpu.upload_video(job["input"])
+        job["log"] += "\n"
+
+        args_str = build_remote_args_str(job)
+        result_path = rgpu.process_video(remote_path, args_str, use_slurm=use_slurm)
+        if not result_path:
+            job["status"] = "failed"
+            rgpu.disconnect()
+            return
+
+        os.makedirs(job["output_dir"], exist_ok=True)
+        local_result = rgpu.download_result(result_path, job["output_dir"])
+
+        job["status"] = "finished"
+        job["progress"] = 1.0
+        job["log"] += f"\nDone! Saved to: {local_result}\n"
+    except Exception as e:
+        job["status"] = "failed"
+        job["log"] += f"\nRemote error: {e}\n"
+    finally:
+        try:
+            rgpu.disconnect()
+        except Exception:
+            pass
+        active_processes.pop(job["id"], None)
+
+
+def _probe_job(job):
+    """Background probe for a newly added job."""
+    info = probe_video(job["input"])
+    job["input_info"] = format_info(info)
+
+
+# ---------------------------------------------------------------------------
+# pywebview JS API
+# ---------------------------------------------------------------------------
 
 class Api:
-    """Exposed to JavaScript via pywebview's JS bridge."""
-
-    def browse_input(self):
+    def browse_files(self):
         window = webview.windows[0]
         result = window.create_file_dialog(
             webview.OPEN_DIALOG,
+            allow_multiple=True,
             file_types=("Video Files (*.mp4;*.mkv;*.avi;*.mov;*.webm)",),
         )
-        if result and len(result) > 0:
-            path = result[0]
-            info = probe_video(path)
-            return json.dumps({"path": path, "info": info})
-        return json.dumps({"path": "", "info": {}})
-
-    def browse_output(self):
-        window = webview.windows[0]
-        result = window.create_file_dialog(
-            webview.SAVE_DIALOG,
-            save_filename="output.mp4",
-            file_types=("MP4 Video (*.mp4)",),
-        )
         if result:
-            return json.dumps({"path": result})
+            return json.dumps({"paths": list(result)})
+        return json.dumps({"paths": []})
+
+    def browse_output_dir(self):
+        window = webview.windows[0]
+        result = window.create_file_dialog(webview.FOLDER_DIALOG)
+        if result and len(result) > 0:
+            return json.dumps({"path": result[0]})
         return json.dumps({"path": ""})
 
     def browse_config(self):
@@ -220,481 +363,550 @@ class Api:
 js_api = Api()
 
 
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
 @app.route("/")
 def index():
     return HTML_PAGE
 
 
-@app.route("/api/state")
-def get_state():
-    return jsonify(state)
+@app.route("/api/jobs")
+def get_jobs():
+    local_name = devices[0]["name"] if devices else "Apple M3"
+    gpu_list = [{"id": "local", "name": "Local GPU (" + local_name + ")"}]
+    for i, c in enumerate(load_gpu_configs()):
+        gpu_list.append({"id": str(i), "name": c.get("name", "Remote GPU " + str(i))})
+    return jsonify(
+        jobs=list(jobs.values()),
+        output_dir=output_dir,
+        gpu_util=gpu_util_data,
+        gpus=gpu_list,
+    )
+
+
+@app.route("/api/jobs/add", methods=["POST"])
+def add_jobs():
+    data = request.json
+    paths = data.get("paths", [])
+    if "input" in data and not paths:
+        paths = [data["input"]]
+
+    added = []
+    for path in paths:
+        job_id = str(uuid.uuid4())[:8]
+        out_dir = output_dir or os.path.dirname(path)
+        job = {
+            "id": job_id,
+            "input": path,
+            "input_name": os.path.basename(path),
+            "input_info": "Analyzing\u2026",
+            "output_dir": out_dir,
+            "output": generate_output_path(path, out_dir),
+            "gpu": data.get("gpu", "local"),
+            "processor": data.get("processor", "realesrgan"),
+            "scale": int(data.get("scale", 4)),
+            "multiplier": int(data.get("multiplier", 2)),
+            "model": data.get("model", "realesr-animevideov3"),
+            "codec": data.get("codec", "libx264"),
+            "width": int(data.get("width", 3840)),
+            "height": int(data.get("height", 2160)),
+            "status": "queued",
+            "progress": 0.0,
+            "frame": 0,
+            "total": 0,
+            "fps": 0.0,
+            "elapsed": "00:00:00",
+            "remaining": "--:--:--",
+            "log": "",
+        }
+        jobs[job_id] = job
+        added.append(job)
+        threading.Thread(target=_probe_job, args=(job,), daemon=True).start()
+
+    return jsonify(ok=True, jobs=added)
+
+
+@app.route("/api/jobs/<job_id>/start", methods=["POST"])
+def start_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error="Job not found"), 404
+    if job["status"] not in ("queued", "failed", "cancelled"):
+        return jsonify(error="Job not startable in current state"), 400
+
+    data = request.json or {}
+    if "gpu" in data:
+        job["gpu"] = data["gpu"]
+
+    job["output_dir"] = output_dir or os.path.dirname(job["input"])
+    job["output"] = generate_output_path(job["input"], job["output_dir"])
+
+    gpu = job["gpu"]
+    if gpu == "local":
+        threading.Thread(target=run_local_job, args=(job,), daemon=True).start()
+    else:
+        configs = load_gpu_configs()
+        try:
+            gpu_idx = int(gpu)
+            if 0 <= gpu_idx < len(configs):
+                threading.Thread(
+                    target=run_remote_job,
+                    args=(job, configs[gpu_idx]),
+                    daemon=True,
+                ).start()
+            else:
+                return jsonify(error="Invalid GPU index"), 400
+        except (ValueError, IndexError):
+            return jsonify(error="Invalid GPU selection"), 400
+
+    return jsonify(ok=True)
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify(error="Job not found"), 404
+
+    p = active_processes.pop(job_id, None)
+    if p:
+        if p["type"] == "local":
+            p["proc"].terminate()
+            try:
+                p["proc"].wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                p["proc"].kill()
+        elif p["type"] == "remote":
+            p["rgpu"]._cancel = True
+
+    job["status"] = "cancelled"
+    job["log"] += "\nCancelled by user.\n"
+    return jsonify(ok=True)
+
+
+@app.route("/api/jobs/<job_id>", methods=["DELETE"])
+def delete_job(job_id):
+    if job_id in active_processes:
+        return jsonify(error="Cannot delete a running job"), 400
+    jobs.pop(job_id, None)
+    return jsonify(ok=True)
+
+
+@app.route("/api/gpus")
+def get_gpus():
+    local_name = devices[0]["name"] if devices else "Apple M3"
+    gpu_list = [{"id": "local", "name": "Local GPU (" + local_name + ")"}]
+    for i, c in enumerate(load_gpu_configs()):
+        gpu_list.append({"id": str(i), "name": c.get("name", "Remote GPU " + str(i))})
+    return jsonify(gpus=gpu_list)
+
+
+@app.route("/api/output-dir", methods=["POST"])
+def set_output_dir():
+    global output_dir
+    output_dir = (request.json or {}).get("path", "")
+    for job in jobs.values():
+        if job["status"] == "queued":
+            job["output_dir"] = output_dir or os.path.dirname(job["input"])
+            job["output"] = generate_output_path(job["input"], job["output_dir"])
+    return jsonify(ok=True, path=output_dir)
+
+
+@app.route("/api/gpu-util")
+def get_gpu_util():
+    return jsonify(gpu_util_data)
 
 
 @app.route("/api/devices")
 def get_devices():
-    return jsonify(state["devices"])
+    return jsonify(devices)
 
 
 @app.route("/api/probe", methods=["POST"])
 def probe():
-    path = request.json.get("path", "")
-    info = probe_video(path)
-    return jsonify(info)
-
-
-@app.route("/api/start", methods=["POST"])
-def start():
-    if state["status"] == "running":
-        return jsonify({"error": "Already running"}), 400
-
-    data = request.json
-    args = [
-        "-i", data["input"],
-        "-o", data["output"],
-        "-p", data["processor"],
-        "-d", str(data.get("device", 0)),
-        "-c", data.get("codec", "libx264"),
-        "--log-level", "info",
-    ]
-
-    proc = data["processor"]
-    if proc in ("realesrgan", "realcugan"):
-        args += ["-s", str(data.get("scale", 4))]
-        if proc == "realesrgan":
-            args += ["--realesrgan-model", data.get("model", "realesr-animevideov3")]
-        else:
-            args += ["--realcugan-model", data.get("model", "models-se")]
-    elif proc == "libplacebo":
-        args += ["-w", str(data.get("width", 3840)), "-h", str(data.get("height", 2160))]
-        args += ["--libplacebo-shader", data.get("model", "anime4k-v4-a")]
-    elif proc == "rife":
-        args += ["-m", str(data.get("multiplier", 2))]
-        args += ["--rife-model", data.get("model", "rife-v4.6")]
-
-    threading.Thread(target=run_processing, args=(args,), daemon=True).start()
-    threading.Thread(target=poll_gpu_utilization, daemon=True).start()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/cancel", methods=["POST"])
-def cancel():
-    global process_handle
-    global gpu_poll_active
-    if process_handle:
-        gpu_poll_active = False
-        state["status"] = "cancelling"
-        state["log"] += "\nCancelling... please wait.\n"
-        process_handle.terminate()
-        try:
-            process_handle.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            process_handle.kill()
-        state["status"] = "idle"
-        state["log"] += "Cancelled.\n"
-        process_handle = None
-    return jsonify({"ok": True})
-
-
-@app.route("/api/reset", methods=["POST"])
-def reset():
-    state["status"] = "idle"
-    return jsonify({"ok": True})
+    path = (request.json or {}).get("path", "")
+    return jsonify(probe_video(path))
 
 
 @app.route("/api/remote/configs")
 def remote_configs():
-    configs = load_gpu_configs()
-    return jsonify({"configs": configs})
+    return jsonify(configs=load_gpu_configs())
 
 
 @app.route("/api/remote/configs/save", methods=["POST"])
 def remote_config_save():
-    gpu = request.json
+    gpu = dict(request.json)
+    pw = gpu.pop("password", None)
     configs = load_gpu_configs()
     configs.append(gpu)
     save_gpu_configs(configs)
-    return jsonify({"ok": True, "configs": load_gpu_configs()})
+    if pw:
+        gpu_passwords[_gpu_key(gpu)] = pw
+    return jsonify(ok=True, configs=load_gpu_configs())
 
 
 @app.route("/api/remote/configs/delete", methods=["POST"])
 def remote_config_delete():
-    idx = request.json.get("index", -1)
+    idx = (request.json or {}).get("index", -1)
     configs = load_gpu_configs()
     if 0 <= idx < len(configs):
         configs.pop(idx)
         save_gpu_configs(configs)
-    return jsonify({"ok": True, "configs": load_gpu_configs()})
+        for job in jobs.values():
+            if job["status"] == "queued" and job["gpu"] != "local":
+                try:
+                    gi = int(job["gpu"])
+                    if gi == idx:
+                        job["gpu"] = "local"
+                    elif gi > idx:
+                        job["gpu"] = str(gi - 1)
+                except ValueError:
+                    pass
+    return jsonify(ok=True, configs=load_gpu_configs())
 
 
-@app.route("/api/remote/connect", methods=["POST"])
-def remote_connect():
-    data = request.json
-    remote_gpu.slurm_opts = data.get("slurm", {})
-    scheduler = data.get("scheduler", "auto")
-    ok = remote_gpu.connect(
-        host=data["host"],
-        username=data.get("user") or data.get("username", ""),
-        password=data.get("password"),
-        key_path=data.get("key_path"),
-        port=int(data.get("port", 22)),
-        proxy=data.get("proxy"),
-        auth=data.get("auth", "key"),
-    )
-    if ok and scheduler == "slurm":
-        state["remote_has_slurm"] = True
-    elif ok and scheduler == "direct":
-        state["remote_has_slurm"] = False
-    return jsonify({"ok": ok, "gpu": state.get("remote_gpu_name", ""), "slurm": state.get("remote_has_slurm", False)})
-
-
-@app.route("/api/remote/disconnect", methods=["POST"])
-def remote_disconnect():
-    remote_gpu.disconnect()
-    state["log"] += "Disconnected from remote.\n"
-    return jsonify({"ok": True})
-
-
-@app.route("/api/remote/start", methods=["POST"])
-def remote_start():
-    if state["status"] == "running":
-        return jsonify({"error": "Already running"}), 400
-
-    data = request.json
-    input_path = data["input"]
-    use_slurm = data.get("use_slurm", False)
-
-    proc_type = data["processor"]
-    args_parts = [f"-p {proc_type}", "-d 0", f"-c {data.get('codec', 'libx264')}", "--log-level info"]
-
-    if proc_type in ("realesrgan", "realcugan"):
-        args_parts.append(f"-s {data.get('scale', 4)}")
-        if proc_type == "realesrgan":
-            args_parts.append(f"--realesrgan-model {data.get('model', 'realesr-animevideov3')}")
-        else:
-            args_parts.append(f"--realcugan-model {data.get('model', 'models-se')}")
-    elif proc_type == "libplacebo":
-        args_parts.append(f"-w {data.get('width', 3840)} -h {data.get('height', 2160)}")
-        args_parts.append(f"--libplacebo-shader {data.get('model', 'anime4k-v4-a')}")
-    elif proc_type == "rife":
-        args_parts.append(f"-m {data.get('multiplier', 2)}")
-        args_parts.append(f"--rife-model {data.get('model', 'rife-v4.6')}")
-
-    args_str = " ".join(args_parts)
-
-    def run_remote():
-        state["status"] = "running"
-        state["frame"] = 0
-        state["total"] = 0
-        state["fps"] = 0.0
-        state["progress"] = 0.0
-        state["elapsed"] = "00:00:00"
-        state["remaining"] = "--:--:--"
-        state["log"] = ""
-        remote_gpu._cancel = False
-
-        try:
-            if not remote_gpu.install_video2x():
-                state["status"] = "failed"
-                return
-
-            remote_path = remote_gpu.upload_video(input_path)
-            state["log"] += "\n"
-
-            result_path = remote_gpu.process_video(remote_path, args_str, use_slurm=use_slurm)
-            if not result_path:
-                state["status"] = "failed"
-                return
-
-            output_dir = os.path.dirname(input_path)
-            local_result = remote_gpu.download_result(result_path, output_dir)
-
-            state["status"] = "finished"
-            state["progress"] = 1.0
-            state["log"] += f"\nDone! Saved to: {local_result}\n"
-        except Exception as e:
-            state["status"] = "failed"
-            state["log"] += f"\nRemote error: {e}\n"
-
-    threading.Thread(target=run_remote, daemon=True).start()
-    return jsonify({"ok": True})
-
+# ---------------------------------------------------------------------------
+# HTML page  (all CSS / HTML / JS inline)
+# ---------------------------------------------------------------------------
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Video2X for Mac</title>
 <style>
-:root {
-  --bg: #1a1a2e;
-  --surface: #16213e;
-  --surface2: #0f3460;
-  --accent: #e94560;
-  --accent2: #533483;
-  --text: #eee;
-  --text2: #aab;
-  --success: #4ade80;
-  --radius: 12px;
+:root{
+  --bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;
+  --accent:#e94560;--accent2:#533483;
+  --text:#eee;--text2:#aab;--success:#4ade80;
+  --radius:12px;
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro', system-ui, sans-serif;
-  background: var(--bg); color: var(--text);
-  height: 100vh; display: flex; flex-direction: column;
-  user-select: none; overflow: hidden;
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'SF Pro',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);
+  height:100vh;display:flex;flex-direction:column;
+  user-select:none;overflow:hidden;
 }
-.header {
-  display: flex; align-items: center; gap: 12px;
-  padding: 16px 24px;
-  background: linear-gradient(135deg, var(--surface), var(--surface2));
-  border-bottom: 1px solid rgba(255,255,255,.06);
+
+/* ---- header ---- */
+.header{
+  display:flex;align-items:center;gap:12px;padding:14px 24px;
+  background:linear-gradient(135deg,var(--surface),var(--surface2));
+  border-bottom:1px solid rgba(255,255,255,.06);
 }
-.header h1 { font-size: 18px; font-weight: 600; }
-.header .sub { font-size: 12px; color: var(--text2); }
-.header .gpu {
-  margin-left: auto; font-size: 12px;
-  background: rgba(255,255,255,.08); padding: 6px 14px;
-  border-radius: 20px; color: var(--text2);
+.header h1{font-size:18px;font-weight:600}
+.header .sub{font-size:12px;color:var(--text2)}
+.header .gpu{
+  margin-left:auto;font-size:12px;
+  background:rgba(255,255,255,.08);padding:6px 14px;
+  border-radius:20px;color:var(--text2);
 }
-.main { display: flex; flex: 1; overflow: hidden; }
-.sidebar {
-  width: 360px; min-width: 320px; overflow-y: auto; padding: 20px;
-  background: var(--surface);
-  border-right: 1px solid rgba(255,255,255,.06);
-  display: flex; flex-direction: column; gap: 20px;
+.cloud-icon{
+  font-size:22px;cursor:pointer;padding:4px 10px;
+  border-radius:8px;transition:all .2s;margin-left:8px;color:var(--text2);
 }
-.content { flex: 1; display: flex; flex-direction: column; }
-.section-title {
-  font-size: 13px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: .5px; color: var(--text2); margin-bottom: 8px;
+.cloud-icon:hover{background:rgba(255,255,255,.1);color:var(--accent)}
+
+/* ---- layout ---- */
+.main{display:flex;flex:1;overflow:hidden}
+.sidebar{
+  width:350px;min-width:310px;overflow-y:auto;padding:20px;
+  background:var(--surface);
+  border-right:1px solid rgba(255,255,255,.06);
+  display:flex;flex-direction:column;gap:20px;
 }
-.dropzone {
-  border: 2px dashed rgba(255,255,255,.15); border-radius: var(--radius);
-  padding: 24px; text-align: center; cursor: pointer; transition: all .2s;
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden}
+
+/* ---- sidebar widgets ---- */
+.section-title{
+  font-size:13px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.5px;color:var(--text2);margin-bottom:8px;
 }
-.dropzone:hover, .dropzone.over {
-  border-color: var(--accent); background: rgba(233,69,96,.05);
+.output-dir-picker{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 14px;background:rgba(255,255,255,.04);
+  border:1px solid rgba(255,255,255,.08);border-radius:8px;
+  cursor:pointer;transition:all .2s;
 }
-.dropzone .icon { font-size: 28px; margin-bottom: 8px; }
-.dropzone .filename { font-size: 14px; font-weight: 500; color: var(--text); }
-.dropzone .info { font-size: 12px; color: var(--text2); margin-top: 4px; }
-.proc-card {
-  padding: 10px 14px; border-radius: 8px; cursor: pointer; transition: all .15s;
-  border: 2px solid transparent; background: rgba(255,255,255,.03);
+.output-dir-picker:hover{border-color:var(--accent);background:rgba(233,69,96,.04)}
+.output-dir-icon{font-size:20px;flex-shrink:0}
+.output-dir-path{
+  flex:1;font-size:12px;color:var(--text2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }
-.proc-card:hover { background: rgba(255,255,255,.06); }
-.proc-card.active { border-color: var(--accent); background: rgba(233,69,96,.08); }
-.proc-card .name { font-size: 14px; font-weight: 600; }
-.proc-card .desc { font-size: 11px; color: var(--text2); margin-top: 2px; }
-.setting-row {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+.proc-card{
+  padding:10px 14px;border-radius:8px;cursor:pointer;transition:all .15s;
+  border:2px solid transparent;background:rgba(255,255,255,.03);
 }
-.setting-row label { font-size: 13px; min-width: 80px; color: var(--text2); }
-.setting-row select, .setting-row input[type="number"], .setting-row input[type="text"] {
-  flex: 1; padding: 6px 10px;
-  background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1);
-  border-radius: 6px; color: var(--text); font-size: 13px;
+.proc-card:hover{background:rgba(255,255,255,.06)}
+.proc-card.active{border-color:var(--accent);background:rgba(233,69,96,.08)}
+.proc-card .name{font-size:14px;font-weight:600}
+.proc-card .desc{font-size:11px;color:var(--text2);margin-top:2px}
+.setting-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.setting-row label{font-size:13px;min-width:80px;color:var(--text2)}
+.setting-row select,.setting-row input[type="number"]{
+  flex:1;padding:6px 10px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);
+  border-radius:6px;color:var(--text);font-size:13px;
 }
-.setting-row select { appearance: auto; }
-.seg-control {
-  display: flex; gap: 0; border-radius: 8px; overflow: hidden;
-  border: 1px solid rgba(255,255,255,.1);
+.setting-row select{appearance:auto}
+.seg-control{
+  display:flex;gap:0;border-radius:8px;overflow:hidden;
+  border:1px solid rgba(255,255,255,.1);
 }
-.seg-control button {
-  flex: 1; padding: 8px; border: none;
-  background: rgba(255,255,255,.05); color: var(--text2);
-  font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s;
+.seg-control button{
+  flex:1;padding:8px;border:none;
+  background:rgba(255,255,255,.05);color:var(--text2);
+  font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;
 }
-.seg-control button.active { background: var(--accent); color: #fff; }
-.btn-primary {
-  width: 100%; padding: 14px; border: none; border-radius: var(--radius);
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
-  color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity .2s;
+.seg-control button.active{background:var(--accent);color:#fff}
+.add-videos-btn{
+  display:flex;align-items:center;justify-content:center;gap:10px;
+  padding:18px;border:2px dashed rgba(255,255,255,.15);
+  border-radius:var(--radius);cursor:pointer;
+  color:var(--text2);font-size:15px;font-weight:600;transition:all .2s;
 }
-.btn-primary:hover { opacity: .9; }
-.btn-primary:disabled { opacity: .4; cursor: not-allowed; }
-.btn-cancel {
-  width: 100%; padding: 14px; border: 2px solid var(--accent);
-  border-radius: var(--radius); background: transparent;
-  color: var(--accent); font-size: 15px; font-weight: 600; cursor: pointer;
+.add-videos-btn:hover{
+  border-color:var(--accent);color:var(--accent);
+  background:rgba(233,69,96,.05);
 }
-.btn-cancel:hover { background: rgba(233,69,96,.1); }
-.progress-area {
-  padding: 24px; background: var(--surface);
-  border-bottom: 1px solid rgba(255,255,255,.06);
+
+/* ---- jobs area ---- */
+.jobs-toolbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 20px 0;
 }
-.progress-bar-wrap {
-  height: 8px; background: rgba(255,255,255,.08);
-  border-radius: 4px; overflow: hidden; margin: 12px 0;
+.jobs-count{font-size:13px;color:var(--text2);font-weight:600}
+.toolbar-btns{display:flex;gap:8px}
+.btn-toolbar{
+  padding:6px 14px;border:1px solid rgba(255,255,255,.1);border-radius:6px;
+  background:transparent;color:var(--text2);font-size:12px;cursor:pointer;
+  transition:all .15s;
 }
-.progress-bar {
-  height: 100%; border-radius: 4px; transition: width .3s;
-  background: linear-gradient(90deg, var(--accent), var(--accent2));
+.btn-toolbar:hover{border-color:var(--accent);color:var(--accent)}
+.btn-start-all{
+  padding:6px 14px;border:none;border-radius:6px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#fff;font-size:12px;font-weight:600;cursor:pointer;
 }
-.stats { display: flex; gap: 0; justify-content: space-around; }
-.stat { text-align: center; }
-.stat .val { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
-.stat .lbl { font-size: 11px; color: var(--text2); margin-top: 2px; }
-.log-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.log-header {
-  display: flex; align-items: center; padding: 12px 20px;
-  font-size: 13px; font-weight: 600; color: var(--text2);
-  border-bottom: 1px solid rgba(255,255,255,.06);
+.btn-start-all:hover{opacity:.9}
+.jobs-container{flex:1;overflow-y:auto;padding:14px 20px 20px}
+
+/* ---- job card ---- */
+.job-card{
+  background:var(--surface);border:1px solid rgba(255,255,255,.08);
+  border-radius:var(--radius);padding:16px;margin-bottom:12px;
+  transition:border-color .3s;
 }
-.log-content {
-  flex: 1; overflow-y: auto; padding: 12px 20px;
-  font-family: 'SF Mono', 'Menlo', monospace;
-  font-size: 12px; line-height: 1.6; color: var(--text2);
-  white-space: pre-wrap; word-break: break-all;
-  user-select: text; -webkit-user-select: text;
+@keyframes pulse-border{
+  0%,100%{border-color:rgba(233,69,96,.15)}
+  50%{border-color:rgba(233,69,96,.35)}
 }
-.badge {
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 8px 16px; border-radius: 8px; font-size: 14px; font-weight: 600;
+.job-card.status-running{animation:pulse-border 2s ease-in-out infinite}
+.job-card.status-finished{border-color:rgba(74,222,128,.2)}
+.job-card.status-failed{border-color:rgba(233,69,96,.2)}
+.job-card.status-cancelled{border-color:rgba(255,200,50,.15)}
+.job-header{display:flex;justify-content:space-between;align-items:flex-start}
+.job-info{flex:1;min-width:0}
+.job-filename{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-meta{font-size:12px;color:var(--text2);margin-top:2px}
+.job-proc-tag{
+  display:inline-block;font-size:11px;padding:2px 8px;margin-top:4px;
+  background:rgba(255,255,255,.06);border-radius:4px;color:var(--text2);
 }
-.badge.success { background: rgba(74,222,128,.1); color: var(--success); }
-.badge.error { background: rgba(233,69,96,.1); color: var(--accent); }
-.badge.warning { background: rgba(255,200,50,.1); color: #fbbf24; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.spinner {
-  display: inline-block; width: 16px; height: 16px;
-  border: 2px solid rgba(255,200,50,.3); border-top-color: #fbbf24;
-  border-radius: 50%; animation: spin .6s linear infinite;
-  vertical-align: middle; margin-right: 8px;
+.job-delete{
+  font-size:18px;cursor:pointer;color:var(--text2);
+  padding:0 6px;border-radius:4px;flex-shrink:0;transition:all .15s;
 }
-.path-input {
-  width: 100%; padding: 8px 10px; margin-top: 6px;
-  background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
-  border-radius: 6px; color: var(--text); font-size: 12px;
-  font-family: 'SF Mono', 'Menlo', monospace;
+.job-delete:hover{color:var(--accent);background:rgba(233,69,96,.1)}
+.job-gpu-row{display:flex;align-items:center;gap:10px;margin-top:10px}
+.job-gpu-row label{font-size:12px;color:var(--text2);min-width:30px}
+.job-gpu-select{
+  flex:1;padding:5px 8px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);
+  border-radius:6px;color:var(--text);font-size:12px;appearance:auto;
 }
-.path-input::placeholder { color: var(--text2); }
-.cloud-icon {
-  font-size: 22px; cursor: pointer; padding: 4px 10px;
-  border-radius: 8px; transition: all .2s; margin-left: 8px;
-  color: var(--text2);
+.job-gpu-select:disabled{opacity:.5}
+.job-progress-row{display:flex;align-items:center;gap:10px;margin-top:10px}
+.job-progress-bar-wrap{
+  flex:1;height:6px;background:rgba(255,255,255,.08);
+  border-radius:3px;overflow:hidden;
 }
-.cloud-icon:hover { background: rgba(255,255,255,.1); color: var(--accent); }
-.cloud-icon.connected { color: var(--success); }
-.cloud-overlay {
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,.3); z-index: 99;
+.job-progress-bar{
+  height:100%;border-radius:3px;transition:width .3s;
+  background:linear-gradient(90deg,var(--accent),var(--accent2));
 }
-.cloud-panel {
-  position: fixed; top: 56px; right: 16px; width: 360px;
-  background: var(--surface); border: 1px solid rgba(255,255,255,.1);
-  border-radius: 12px; padding: 20px; z-index: 100;
-  box-shadow: 0 12px 40px rgba(0,0,0,.5);
+.status-finished .job-progress-bar{background:var(--success)}
+.status-failed .job-progress-bar{background:var(--accent)}
+.status-cancelled .job-progress-bar{background:#fbbf24}
+.job-pct{
+  font-size:13px;font-weight:700;min-width:38px;text-align:right;
+  color:var(--accent);font-variant-numeric:tabular-nums;
 }
-.cloud-panel-title {
-  font-size: 15px; font-weight: 700; margin-bottom: 6px;
+.status-finished .job-pct{color:var(--success)}
+.job-stats{
+  display:flex;gap:16px;margin-top:8px;
+  font-size:12px;color:var(--text2);font-variant-numeric:tabular-nums;
 }
-.cloud-add-card {
-  display: flex; align-items: center; justify-content: center; gap: 8px;
-  padding: 16px; border: 2px dashed rgba(255,255,255,.12);
-  border-radius: 10px; cursor: pointer; color: var(--text2);
-  font-size: 13px; transition: all .2s; margin-top: 8px;
+.job-actions{display:flex;gap:8px;margin-top:10px}
+.job-btn{
+  padding:6px 16px;border-radius:6px;font-size:12px;
+  font-weight:600;cursor:pointer;transition:all .15s;
 }
-.cloud-add-card:hover { border-color: var(--accent); color: var(--accent); background: rgba(233,69,96,.04); }
-.cloud-gpu-item {
-  padding: 10px 14px; border-radius: 8px; cursor: pointer;
-  border: 1px solid rgba(255,255,255,.08); margin-bottom: 6px;
-  background: rgba(255,255,255,.03); transition: all .15s;
-  position: relative;
+.job-btn.start{
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  border:none;color:#fff;
 }
-.cloud-gpu-item:hover { border-color: var(--accent); background: rgba(233,69,96,.05); }
-.cloud-gpu-item .cg-name { font-size: 14px; font-weight: 600; }
-.cloud-gpu-item .cg-host { font-size: 11px; color: var(--text2); margin-top: 2px; }
-.cloud-gpu-item .cg-tag {
-  display: inline-block; font-size: 10px; padding: 2px 8px;
-  background: rgba(255,255,255,.08); border-radius: 4px;
-  color: var(--text2); margin-top: 4px;
+.job-btn.cancel{
+  background:transparent;border:1px solid var(--accent);color:var(--accent);
 }
-.cloud-gpu-item .cg-delete {
-  position: absolute; top: 8px; right: 10px; font-size: 14px;
-  color: var(--text2); cursor: pointer; opacity: 0; transition: opacity .15s;
-  padding: 2px 6px; border-radius: 4px;
+.job-btn.cancel:hover{background:rgba(233,69,96,.1)}
+.job-btn.retry{
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);
+  color:var(--text);
 }
-.cloud-gpu-item:hover .cg-delete { opacity: 1; }
-.cloud-gpu-item .cg-delete:hover { color: var(--accent); background: rgba(233,69,96,.15); }
-.cloud-type-card {
-  display: flex; align-items: center; gap: 14px;
-  padding: 14px; border: 1px solid rgba(255,255,255,.08);
-  border-radius: 10px; cursor: pointer; margin-bottom: 8px;
-  background: rgba(255,255,255,.03); transition: all .15s;
+.job-btn.retry:hover{border-color:var(--accent);color:var(--accent)}
+.job-btn.remove{
+  background:transparent;border:1px solid rgba(255,255,255,.08);
+  color:var(--text2);
 }
-.cloud-type-card:hover { border-color: var(--accent); background: rgba(233,69,96,.05); }
-.ct-icon { font-size: 26px; }
-.ct-name { font-size: 14px; font-weight: 600; }
-.ct-desc { font-size: 11px; color: var(--text2); margin-top: 2px; }
-.cp-back {
-  font-size: 18px; cursor: pointer; padding: 2px 8px;
-  border-radius: 6px; color: var(--text2); transition: all .15s;
+.job-btn.remove:hover{border-color:var(--accent);color:var(--accent)}
+.job-log-toggle{
+  font-size:11px;color:var(--text2);cursor:pointer;
+  padding:2px 8px;border-radius:4px;background:rgba(255,255,255,.06);
+  margin-left:auto;transition:all .15s;
 }
-.cp-back:hover { color: var(--text); background: rgba(255,255,255,.08); }
-.cp-field { margin-bottom: 10px; }
-.cp-field label { display: block; font-size: 11px; color: var(--text2); margin-bottom: 4px; font-weight: 600; }
-.cp-field input, .cp-field select {
-  width: 100%; padding: 8px 10px;
-  background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.1);
-  border-radius: 6px; color: var(--text); font-size: 13px;
+.job-log-toggle:hover{color:var(--text);background:rgba(255,255,255,.1)}
+.job-log{
+  margin-top:8px;max-height:120px;overflow-y:auto;padding:8px 10px;
+  background:rgba(0,0,0,.25);border-radius:6px;
+  font-family:'SF Mono','Menlo',monospace;font-size:11px;
+  line-height:1.5;color:var(--text2);white-space:pre-wrap;word-break:break-all;
+  user-select:text;-webkit-user-select:text;
 }
-.cp-field select { appearance: auto; }
-.cp-field-row { display: flex; gap: 10px; }
-.cp-field-row .cp-field { flex: 1; }
-.gpu-gauge-wrap {
-  margin-top: 16px; padding: 14px; border-radius: 10px;
-  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
-  display: none;
+.badge{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600;
 }
-.gpu-gauge-wrap.active { display: block; }
-.gpu-gauge-title {
-  font-size: 12px; font-weight: 600; color: var(--text2);
-  text-transform: uppercase; letter-spacing: .5px; margin-bottom: 10px;
+.badge.success{background:rgba(74,222,128,.1);color:var(--success)}
+.badge.error{background:rgba(233,69,96,.1);color:var(--accent)}
+.badge.warning{background:rgba(255,200,50,.1);color:#fbbf24}
+.empty-state{
+  display:flex;flex-direction:column;align-items:center;
+  justify-content:center;height:100%;color:var(--text2);
 }
-.gpu-gauge-row {
-  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+.empty-icon{font-size:48px;margin-bottom:16px;opacity:.6}
+.empty-text{font-size:18px;font-weight:600;margin-bottom:6px}
+.empty-sub{font-size:13px}
+
+/* ---- cloud panel ---- */
+.cloud-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,.3);z-index:99;
 }
-.gpu-gauge-row:last-child { margin-bottom: 0; }
-.gpu-gauge-label { font-size: 12px; color: var(--text2); min-width: 70px; }
-.gpu-gauge-bar {
-  flex: 1; height: 10px; background: rgba(255,255,255,.08);
-  border-radius: 5px; overflow: hidden;
+.cloud-panel{
+  position:fixed;top:56px;right:16px;width:360px;
+  background:var(--surface);border:1px solid rgba(255,255,255,.1);
+  border-radius:12px;padding:20px;z-index:100;
+  box-shadow:0 12px 40px rgba(0,0,0,.5);max-height:80vh;overflow-y:auto;
 }
-.gpu-gauge-fill {
-  height: 100%; border-radius: 5px; transition: width .8s, background .5s;
+.cloud-panel-title{font-size:15px;font-weight:700;margin-bottom:6px}
+.cloud-add-card{
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  padding:16px;border:2px dashed rgba(255,255,255,.12);
+  border-radius:10px;cursor:pointer;color:var(--text2);
+  font-size:13px;transition:all .2s;margin-top:8px;
 }
-.gpu-gauge-val {
-  font-size: 13px; font-weight: 700; min-width: 42px; text-align: right;
-  font-variant-numeric: tabular-nums;
+.cloud-add-card:hover{border-color:var(--accent);color:var(--accent);background:rgba(233,69,96,.04)}
+.cloud-gpu-item{
+  padding:10px 14px;border-radius:8px;
+  border:1px solid rgba(255,255,255,.08);margin-bottom:6px;
+  background:rgba(255,255,255,.03);transition:all .15s;position:relative;
+}
+.cloud-gpu-item:hover{border-color:var(--accent);background:rgba(233,69,96,.05)}
+.cloud-gpu-item .cg-name{font-size:14px;font-weight:600}
+.cloud-gpu-item .cg-host{font-size:11px;color:var(--text2);margin-top:2px}
+.cloud-gpu-item .cg-tag{
+  display:inline-block;font-size:10px;padding:2px 8px;
+  background:rgba(255,255,255,.08);border-radius:4px;
+  color:var(--text2);margin-top:4px;
+}
+.cloud-gpu-item .cg-delete{
+  position:absolute;top:8px;right:10px;font-size:14px;
+  color:var(--text2);cursor:pointer;opacity:0;transition:opacity .15s;
+  padding:2px 6px;border-radius:4px;
+}
+.cloud-gpu-item:hover .cg-delete{opacity:1}
+.cloud-gpu-item .cg-delete:hover{color:var(--accent);background:rgba(233,69,96,.15)}
+.cloud-type-card{
+  display:flex;align-items:center;gap:14px;
+  padding:14px;border:1px solid rgba(255,255,255,.08);
+  border-radius:10px;cursor:pointer;margin-bottom:8px;
+  background:rgba(255,255,255,.03);transition:all .15s;
+}
+.cloud-type-card:hover{border-color:var(--accent);background:rgba(233,69,96,.05)}
+.ct-icon{font-size:26px}
+.ct-name{font-size:14px;font-weight:600}
+.ct-desc{font-size:11px;color:var(--text2);margin-top:2px}
+.cp-back{
+  font-size:18px;cursor:pointer;padding:2px 8px;
+  border-radius:6px;color:var(--text2);transition:all .15s;
+}
+.cp-back:hover{color:var(--text);background:rgba(255,255,255,.08)}
+.cp-field{margin-bottom:10px}
+.cp-field label{display:block;font-size:11px;color:var(--text2);margin-bottom:4px;font-weight:600}
+.cp-field input,.cp-field select{
+  width:100%;padding:8px 10px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.1);
+  border-radius:6px;color:var(--text);font-size:13px;
+}
+.cp-field select{appearance:auto}
+.cp-field-row{display:flex;gap:10px}
+.cp-field-row .cp-field{flex:1}
+.btn-primary{
+  width:100%;padding:14px;border:none;border-radius:var(--radius);
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:opacity .2s;
+}
+.btn-primary:hover{opacity:.9}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{
+  display:inline-block;width:16px;height:16px;
+  border:2px solid rgba(255,200,50,.3);border-top-color:#fbbf24;
+  border-radius:50%;animation:spin .6s linear infinite;
+  vertical-align:middle;margin-right:8px;
 }
 </style>
 </head>
 <body>
 
+<!-- ==================== HEADER ==================== -->
 <div class="header">
   <div>
     <h1>Video2X for Mac</h1>
     <div class="sub">ML-powered video upscaling &amp; frame interpolation</div>
   </div>
   <div class="gpu" id="gpuBadge">Detecting GPU...</div>
-  <div class="cloud-icon" id="cloudIcon" onclick="toggleCloudPanel()" title="Connect to external GPU">&#9729;</div>
+  <div class="cloud-icon" id="cloudIcon" onclick="toggleCloudPanel()" title="Manage remote GPUs">&#9729;</div>
 </div>
 
+<!-- ==================== CLOUD PANEL ==================== -->
 <div class="cloud-overlay" id="cloudOverlay" style="display:none" onclick="toggleCloudPanel()"></div>
 <div class="cloud-panel" id="cloudPanel" style="display:none">
-  <!-- Main list view -->
+
   <div id="cpList">
     <div class="cloud-panel-title">External GPUs</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px">Manage remote GPUs available for per-file assignment.</div>
     <div id="cloudCards"></div>
     <div class="cloud-add-card" onclick="showAddStep1()">
-      <span style="font-size:22px">+</span>
-      <span>Add External GPU</span>
+      <span style="font-size:22px">+</span><span>Add External GPU</span>
     </div>
   </div>
 
-  <!-- Step 1: Pick type -->
   <div id="cpStep1" style="display:none">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span class="cp-back" onclick="showList()">&larr;</span>
@@ -702,28 +914,18 @@ body {
     </div>
     <div class="cloud-type-card" onclick="showAddStep2('slurm')">
       <div class="ct-icon">&#128421;</div>
-      <div>
-        <div class="ct-name">SLURM Cluster</div>
-        <div class="ct-desc">HPC cluster with job scheduler (sbatch/srun)</div>
-      </div>
+      <div><div class="ct-name">SLURM Cluster</div><div class="ct-desc">HPC cluster with job scheduler</div></div>
     </div>
     <div class="cloud-type-card" onclick="showAddStep2('direct')">
       <div class="ct-icon">&#128187;</div>
-      <div>
-        <div class="ct-name">SSH Direct</div>
-        <div class="ct-desc">GPU workstation or server with direct access</div>
-      </div>
+      <div><div class="ct-name">SSH Direct</div><div class="ct-desc">GPU workstation or server with direct access</div></div>
     </div>
     <div class="cloud-type-card" onclick="showAddStep2('cloud')">
       <div class="ct-icon">&#9729;</div>
-      <div>
-        <div class="ct-name">Cloud Provider</div>
-        <div class="ct-desc">RunPod, Vast.ai, Lambda, or any cloud GPU</div>
-      </div>
+      <div><div class="ct-name">Cloud Provider</div><div class="ct-desc">RunPod, Vast.ai, Lambda, or any cloud GPU</div></div>
     </div>
   </div>
 
-  <!-- Step 2: Fill fields -->
   <div id="cpStep2" style="display:none">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
       <span class="cp-back" onclick="showAddStep1()">&larr;</span>
@@ -732,50 +934,20 @@ body {
     <div id="cpFields"></div>
     <button class="btn-primary" style="font-size:13px;padding:10px;margin-top:8px" onclick="saveNewGpu()">Add GPU</button>
   </div>
-
-  <!-- Connected view -->
-  <div id="cpConnected" style="display:none">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-      <span class="cp-back" onclick="disconnectRemote()">&larr;</span>
-      <div class="cloud-panel-title" style="margin:0">Connected</div>
-    </div>
-    <div class="badge success" id="cloudBadge" style="font-size:12px;margin-bottom:10px"></div>
-    <button class="btn-cancel" style="font-size:12px;padding:8px" onclick="disconnectRemote()">Disconnect</button>
-  </div>
-
-  <!-- Password prompt -->
-  <div id="cpPassword" style="display:none">
-    <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-      <span class="cp-back" onclick="showList()">&larr;</span>
-      <div class="cloud-panel-title" style="margin:0">Enter Password</div>
-    </div>
-    <div class="cp-field">
-      <label>Password</label>
-      <input id="sshPass" type="password" placeholder="SSH password">
-    </div>
-    <button class="btn-primary" style="font-size:13px;padding:10px;margin-top:8px" onclick="submitPassword()">Connect</button>
-  </div>
-
-  <!-- Connecting spinner -->
-  <div id="cpConnecting" style="display:none;text-align:center;padding:30px 0">
-    <div class="spinner" style="width:28px;height:28px;border-width:3px;margin:0 auto 12px"></div>
-    <div style="font-size:13px;color:var(--text2)" id="cpConnectMsg">Connecting...</div>
-  </div>
 </div>
 
+<!-- ==================== MAIN LAYOUT ==================== -->
 <div class="main">
+
+  <!-- ---- sidebar ---- -->
   <div class="sidebar">
 
     <div>
-      <div class="section-title">Input Video</div>
-      <div class="dropzone" id="dropzone" onclick="browseInput()">
-        <div class="icon">&#127916;</div>
-        <div class="filename" id="inputName">Click to browse for a video</div>
-        <div class="info" id="inputInfo"></div>
+      <div class="section-title">Output Directory</div>
+      <div class="output-dir-picker" onclick="browseOutputDir()">
+        <span class="output-dir-icon">&#128193;</span>
+        <span class="output-dir-path" id="outputDirDisplay">Click to select output folder</span>
       </div>
-      <input class="path-input" id="pathInput" type="text"
-             placeholder="Or paste full file path here and press Enter"
-             onkeydown="if(event.key==='Enter') loadPathInput()">
     </div>
 
     <div>
@@ -786,96 +958,74 @@ body {
     <div>
       <div class="section-title">Settings</div>
       <div id="settingsArea"></div>
-    </div>
-
-    <div>
-      <div class="section-title">Output</div>
-      <div class="setting-row">
+      <div class="setting-row" style="margin-top:10px">
         <label>Codec</label>
         <select id="codec">
           <option value="libx264">H.264</option>
           <option value="libx265">H.265 (HEVC)</option>
         </select>
       </div>
-      <div class="setting-row">
-        <label>Output</label>
-        <input id="outputPath" type="text" placeholder="Auto-generated"
-               style="cursor:text">
-      </div>
     </div>
 
-    <div id="actionArea"></div>
+    <div class="add-videos-btn" onclick="browseFiles()">
+      <span style="font-size:22px">+</span><span>Add Videos</span>
+    </div>
 
   </div>
 
+  <!-- ---- content ---- -->
   <div class="content">
-    <div class="progress-area">
-      <div style="display:flex;align-items:center;justify-content:space-between">
-        <span style="font-weight:600">Progress</span>
-        <span id="pctText" style="font-size:22px;font-weight:700;color:var(--accent)">0%</span>
-      </div>
-      <div class="progress-bar-wrap">
-        <div class="progress-bar" id="progressBar" style="width:0%"></div>
-      </div>
-      <div class="stats">
-        <div class="stat"><div class="val" id="statFrame">--</div><div class="lbl">Frame</div></div>
-        <div class="stat"><div class="val" id="statFps">--</div><div class="lbl">FPS</div></div>
-        <div class="stat"><div class="val" id="statElapsed">--</div><div class="lbl">Elapsed</div></div>
-        <div class="stat"><div class="val" id="statRemaining">--</div><div class="lbl">Remaining</div></div>
-      </div>
-      <div class="gpu-gauge-wrap" id="gpuGauge">
-        <div class="gpu-gauge-title">GPU Utilization</div>
-        <div class="gpu-gauge-row">
-          <span class="gpu-gauge-label">Device</span>
-          <div class="gpu-gauge-bar"><div class="gpu-gauge-fill" id="gpuBarDevice" style="width:0%"></div></div>
-          <span class="gpu-gauge-val" id="gpuValDevice">0%</span>
-        </div>
-        <div class="gpu-gauge-row">
-          <span class="gpu-gauge-label">Renderer</span>
-          <div class="gpu-gauge-bar"><div class="gpu-gauge-fill" id="gpuBarRender" style="width:0%"></div></div>
-          <span class="gpu-gauge-val" id="gpuValRender">0%</span>
-        </div>
-        <div class="gpu-gauge-row">
-          <span class="gpu-gauge-label">Tiler</span>
-          <div class="gpu-gauge-bar"><div class="gpu-gauge-fill" id="gpuBarTiler" style="width:0%"></div></div>
-          <span class="gpu-gauge-val" id="gpuValTiler">0%</span>
-        </div>
+    <div class="jobs-toolbar" id="jobsToolbar" style="display:none">
+      <span class="jobs-count" id="jobCount"></span>
+      <div class="toolbar-btns">
+        <button class="btn-toolbar" id="btnClear" onclick="clearCompleted()" style="display:none">Clear Done</button>
+        <button class="btn-start-all" id="btnStartAll" onclick="startAllQueued()" style="display:none">&#9654; Start All</button>
       </div>
     </div>
-    <div class="log-area">
-      <div class="log-header">
-        <span>Log Output</span>
-        <span style="margin-left:auto;cursor:pointer;font-size:11px;padding:3px 10px;background:rgba(255,255,255,.08);border-radius:4px" onclick="copyLog()">Copy</span>
+    <div class="jobs-container" id="jobList">
+      <div class="empty-state">
+        <div class="empty-icon">&#127916;</div>
+        <div class="empty-text">Add videos to get started</div>
+        <div class="empty-sub">Select video files to add them to the processing queue</div>
       </div>
-      <div class="log-content" id="logContent">Ready. Select a video and click Start Processing.</div>
     </div>
   </div>
+
 </div>
 
 <script>
-const PROCESSORS = [
-  {id:'realesrgan', name:'Real-ESRGAN', desc:'Best for general video & anime upscaling',
+/* ================================================================
+   ES5 JavaScript — no const/let, no arrow functions, no templates
+   ================================================================ */
+
+var PROCESSORS = [
+  {id:'realesrgan',name:'Real-ESRGAN',desc:'Best for general video & anime upscaling',
    models:['realesr-animevideov3','realesrgan-plus-anime','realesrgan-plus','realesr-generalv3']},
-  {id:'realcugan', name:'Real-CUGAN', desc:'Optimized for anime upscaling',
+  {id:'realcugan',name:'Real-CUGAN',desc:'Optimized for anime upscaling',
    models:['models-se','models-pro','models-nose']},
-  {id:'libplacebo', name:'Anime4K (libplacebo)', desc:'Shader-based upscaling',
+  {id:'libplacebo',name:'Anime4K (libplacebo)',desc:'Shader-based upscaling',
    models:['anime4k-v4-a','anime4k-v4-a+a','anime4k-v4-b','anime4k-v4-b+b','anime4k-v4-c','anime4k-v4-c+a']},
-  {id:'rife', name:'RIFE', desc:'Increases frame rate for smoother motion',
-   models:['rife-v4.26','rife-v4.25','rife-v4.25-lite','rife-v4.6','rife-v4']},
+  {id:'rife',name:'RIFE',desc:'Increases frame rate for smoother motion',
+   models:['rife-v4.26','rife-v4.25','rife-v4.25-lite','rife-v4.6','rife-v4']}
 ];
 
 var selectedProc = 'realesrgan';
-var inputPath = '';
 var scale = 4;
 var multiplier = 2;
-var computeMode = 'local';
-var remoteConnected = false;
-var remoteSlurm = false;
+var outputDir = '';
+var jobsData = [];
+var gpuList = [];
+var gpuConfigs = [];
+var addingType = '';
+var lastJobIds = '';
+var lastJobStates = {};
+var expandedLogs = {};
+
+/* ---------- init ---------- */
 
 function init() {
   renderProcessors();
   renderSettings();
-  renderAction();
   fetch('/api/devices').then(function(r){return r.json()}).then(function(devs) {
     if (devs.length > 0) {
       document.getElementById('gpuBadge').textContent = '\u{1F7E2} ' + devs[0].name;
@@ -885,6 +1035,8 @@ function init() {
   }).catch(function(){});
   startPolling();
 }
+
+/* ---------- processors & settings ---------- */
 
 function renderProcessors() {
   var el = document.getElementById('procCards');
@@ -949,175 +1101,338 @@ function renderSettings() {
   document.getElementById('settingsArea').innerHTML = html;
 }
 
-function renderAction() {
-  var el = document.getElementById('actionArea');
-  fetch('/api/state').then(function(r){return r.json()}).then(function(s) {
-    if (s.status === 'cancelling') {
-      el.innerHTML = '<div class="badge warning"><span class="spinner"></span>Cancelling...</div>';
-    } else if (s.status === 'running') {
-      el.innerHTML = '<button class="btn-cancel" onclick="cancelProcessing()">Cancel Processing</button>';
-    } else if (s.status === 'finished') {
-      el.innerHTML = '<div class="badge success">\u2713 Processing Complete!</div>' +
-        '<button class="btn-primary" style="margin-top:10px" onclick="resetState()">Process Another</button>';
-    } else if (s.status === 'failed') {
-      el.innerHTML = '<div class="badge error">\u2717 Processing Failed</div>' +
-        '<button class="btn-primary" style="margin-top:10px" onclick="resetState()">Try Again</button>';
-    } else {
-      if (computeMode === 'cloud' && remoteConnected) {
-        var dis = inputPath ? '' : ' disabled';
-        el.innerHTML = '<button class="btn-primary" onclick="startRemoteProcessing()"' + dis + '>\u{2601}\uFE0F Start on Cloud GPU</button>';
-      } else {
-        var dis = inputPath ? '' : ' disabled';
-        el.innerHTML = '<button class="btn-primary" onclick="startProcessing()"' + dis + '>Start Processing</button>';
-      }
-    }
-  }).catch(function(){});
-}
+/* ---------- file & dir browsing ---------- */
 
-function browseInput() {
+function browseOutputDir() {
   if (window.pywebview) {
-    window.pywebview.api.browse_input().then(function(result) {
+    window.pywebview.api.browse_output_dir().then(function(result) {
       var d = JSON.parse(result);
       if (d.path) {
-        setInput(d.path, d.info);
+        outputDir = d.path;
+        document.getElementById('outputDirDisplay').textContent = d.path;
+        document.getElementById('outputDirDisplay').title = d.path;
+        fetch('/api/output-dir', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({path: d.path})
+        });
       }
     });
   } else {
-    alert('File browser not available. Paste a file path in the box below instead.');
-  }
-}
-
-function loadPathInput() {
-  var path = document.getElementById('pathInput').value.trim();
-  if (!path) return;
-  fetch('/api/probe', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({path: path})
-  }).then(function(r){return r.json()}).then(function(info) {
-    if (info.width) {
-      setInput(path, info);
-    } else {
-      alert('Could not read video at: ' + path);
+    var path = prompt('Enter output directory path:');
+    if (path) {
+      outputDir = path;
+      document.getElementById('outputDirDisplay').textContent = path;
+      fetch('/api/output-dir', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({path: path})
+      });
     }
-  });
-}
-
-function setInput(path, info) {
-  inputPath = path;
-  var parts = path.replace(/\\/g, '/').split('/');
-  document.getElementById('inputName').textContent = parts[parts.length - 1];
-  document.getElementById('pathInput').value = path;
-  if (info && info.width) {
-    document.getElementById('inputInfo').textContent =
-      info.width + 'x' + info.height + ' | ' + info.fps + ' fps | ' + info.duration + 's | ' + info.size_mb + ' MB';
   }
-  renderAction();
 }
 
-function browseOutput() {
+function browseFiles() {
   if (window.pywebview) {
-    window.pywebview.api.browse_output().then(function(result) {
+    window.pywebview.api.browse_files().then(function(result) {
       var d = JSON.parse(result);
-      if (d.path) document.getElementById('outputPath').value = d.path;
+      if (d.paths && d.paths.length > 0) {
+        addFiles(d.paths);
+      }
     });
+  } else {
+    var path = prompt('Enter video file path:');
+    if (path) addFiles([path]);
   }
 }
 
-function startProcessing() {
-  if (!inputPath) return;
-  var output = document.getElementById('outputPath').value;
-  if (!output) {
-    var parts = inputPath.split('.');
-    var ext = parts.pop();
-    output = parts.join('.') + '_upscaled.' + ext;
-  }
-
+function addFiles(paths) {
   var modelEl = document.getElementById('model');
+  var codecEl = document.getElementById('codec');
   var body = {
-    input: inputPath,
-    output: output,
+    paths: paths,
     processor: selectedProc,
     scale: scale,
     multiplier: multiplier,
     model: modelEl ? modelEl.value : '',
-    codec: document.getElementById('codec').value,
-    device: 0
+    codec: codecEl ? codecEl.value : 'libx264'
   };
-
   if (selectedProc === 'libplacebo') {
     var wEl = document.getElementById('outW');
     var hEl = document.getElementById('outH');
     body.width = parseInt(wEl ? wEl.value : '3840');
     body.height = parseInt(hEl ? hEl.value : '2160');
   }
-
-  fetch('/api/start', {method:'POST', headers:{'Content-Type':'application/json'},
+  fetch('/api/jobs/add', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
-  }).then(function() { renderAction(); });
+  }).then(function(r){return r.json()}).then(function() {
+    lastJobIds = '';
+  });
 }
 
-function cancelProcessing() {
-  fetch('/api/cancel', {method:'POST'}).then(function() { renderAction(); });
-}
-
-function resetState() {
-  fetch('/api/reset', {method:'POST'}).then(function() { renderAction(); });
-}
+/* ---------- polling ---------- */
 
 function startPolling() {
   setInterval(function() {
-    fetch('/api/state').then(function(r){return r.json()}).then(function(s) {
-      var pct = Math.round(s.progress * 100);
-      document.getElementById('pctText').textContent = pct + '%';
-      document.getElementById('progressBar').style.width = pct + '%';
-      document.getElementById('statFrame').textContent = s.total > 0 ? s.frame + '/' + s.total : '--';
-      document.getElementById('statFps').textContent = s.fps > 0 ? s.fps.toFixed(1) : '--';
-      document.getElementById('statElapsed').textContent = s.elapsed;
-      document.getElementById('statRemaining').textContent = s.remaining;
-      var logEl = document.getElementById('logContent');
-      if (s.log) { logEl.textContent = s.log; logEl.scrollTop = logEl.scrollHeight; }
-
-      var isActive = s.status === 'running' || s.status === 'cancelling';
-      var gaugeEl = document.getElementById('gpuGauge');
-      if (isActive) {
-        gaugeEl.classList.add('active');
-        updateGpuBar('Device', s.gpu_util);
-        updateGpuBar('Render', s.gpu_render);
-        updateGpuBar('Tiler', s.gpu_tiler);
-        var badge = document.getElementById('gpuBadge');
-        badge.textContent = '\u{1F7E2} Apple M3 \u2022 ' + s.gpu_util + '%';
-      } else {
-        gaugeEl.classList.remove('active');
+    fetch('/api/jobs').then(function(r){return r.json()}).then(function(d) {
+      jobsData = d.jobs;
+      gpuList = d.gpus || [];
+      if (d.output_dir && !outputDir) {
+        outputDir = d.output_dir;
+        document.getElementById('outputDirDisplay').textContent = d.output_dir;
       }
-
-      renderAction();
+      updateJobsUI();
+      updateGpuBadge(d.gpu_util);
     }).catch(function(){});
   }, 500);
 }
 
-function updateGpuBar(name, val) {
-  var bar = document.getElementById('gpuBar' + name);
-  var label = document.getElementById('gpuVal' + name);
-  if (!bar || !label) return;
-  bar.style.width = val + '%';
-  label.textContent = val + '%';
-  if (val > 80) {
-    bar.style.background = '#e94560';
-    label.style.color = '#e94560';
-  } else if (val > 40) {
-    bar.style.background = '#fbbf24';
-    label.style.color = '#fbbf24';
-  } else {
-    bar.style.background = '#4ade80';
-    label.style.color = '#4ade80';
+function updateGpuBadge(gu) {
+  if (!gu) return;
+  var badge = document.getElementById('gpuBadge');
+  var hasRunning = false;
+  for (var i = 0; i < jobsData.length; i++) {
+    if (jobsData[i].status === 'running' && jobsData[i].gpu === 'local') {
+      hasRunning = true; break;
+    }
+  }
+  if (hasRunning && gu.gpu_util > 0) {
+    badge.textContent = '\u{1F7E2} Apple M3 \u2022 ' + gu.gpu_util + '%';
   }
 }
 
-var gpuConfigs = [];
-var pendingConfig = null;
-var addingType = '';
+/* ---------- job list rendering ---------- */
+
+function updateJobsUI() {
+  var container = document.getElementById('jobList');
+  var toolbar = document.getElementById('jobsToolbar');
+
+  if (jobsData.length === 0) {
+    toolbar.style.display = 'none';
+    container.innerHTML = '<div class="empty-state">' +
+      '<div class="empty-icon">&#127916;</div>' +
+      '<div class="empty-text">Add videos to get started</div>' +
+      '<div class="empty-sub">Select video files to add them to the processing queue</div></div>';
+    lastJobIds = '';
+    lastJobStates = {};
+    return;
+  }
+
+  var needFullRender = false;
+  var currentIds = [];
+  var hasQueued = false;
+  var hasDone = false;
+  for (var i = 0; i < jobsData.length; i++) {
+    var j = jobsData[i];
+    currentIds.push(j.id);
+    if (lastJobStates[j.id] !== j.status) needFullRender = true;
+    if (j.status === 'queued') hasQueued = true;
+    if (j.status === 'finished' || j.status === 'failed' || j.status === 'cancelled') hasDone = true;
+  }
+  var idsStr = currentIds.join(',');
+  if (idsStr !== lastJobIds) needFullRender = true;
+
+  // toolbar
+  toolbar.style.display = 'flex';
+  document.getElementById('jobCount').textContent = jobsData.length + (jobsData.length === 1 ? ' job' : ' jobs');
+  document.getElementById('btnStartAll').style.display = hasQueued ? 'inline-block' : 'none';
+  document.getElementById('btnClear').style.display = hasDone ? 'inline-block' : 'none';
+
+  if (needFullRender) {
+    renderJobList();
+    lastJobIds = idsStr;
+    lastJobStates = {};
+    for (var i = 0; i < jobsData.length; i++) {
+      lastJobStates[jobsData[i].id] = jobsData[i].status;
+    }
+  } else {
+    for (var i = 0; i < jobsData.length; i++) {
+      updateJobCard(jobsData[i]);
+    }
+  }
+}
+
+function renderJobList() {
+  var container = document.getElementById('jobList');
+  var html = '';
+  for (var i = 0; i < jobsData.length; i++) {
+    html += buildJobCardHTML(jobsData[i]);
+  }
+  container.innerHTML = html;
+}
+
+function formatProcTag(job) {
+  var names = {realesrgan:'Real-ESRGAN',realcugan:'Real-CUGAN',libplacebo:'Anime4K',rife:'RIFE'};
+  var n = names[job.processor] || job.processor;
+  if (job.processor === 'rife') return n + ' \u00b7 ' + job.multiplier + 'x \u00b7 ' + job.model;
+  if (job.processor === 'libplacebo') return n + ' \u00b7 ' + job.width + 'x' + job.height + ' \u00b7 ' + job.model;
+  return n + ' \u00b7 ' + job.scale + 'x \u00b7 ' + job.model;
+}
+
+function escH(t) {
+  var d = document.createElement('div');
+  d.appendChild(document.createTextNode(t || ''));
+  return d.innerHTML;
+}
+
+function buildJobCardHTML(job) {
+  var sc = 'status-' + job.status;
+  var h = '<div class="job-card ' + sc + '" id="job-' + job.id + '">';
+
+  /* header */
+  h += '<div class="job-header"><div class="job-info">';
+  h += '<div class="job-filename">' + escH(job.input_name) + '</div>';
+  h += '<div class="job-meta">' + escH(job.input_info) + '</div>';
+  h += '<div class="job-proc-tag">' + escH(formatProcTag(job)) + '</div>';
+  h += '</div>';
+  if (job.status !== 'running') {
+    h += '<span class="job-delete" onclick="deleteJob(\'' + job.id + '\')">&times;</span>';
+  }
+  h += '</div>';
+
+  /* gpu selector */
+  var gpuDisabled = (job.status !== 'queued' && job.status !== 'failed' && job.status !== 'cancelled') ? ' disabled' : '';
+  h += '<div class="job-gpu-row"><label>GPU</label>';
+  h += '<select class="job-gpu-select" id="gpu-' + job.id + '" onchange="setJobGpu(\'' + job.id + '\',this.value)"' + gpuDisabled + '>';
+  for (var g = 0; g < gpuList.length; g++) {
+    var sel = gpuList[g].id === job.gpu ? ' selected' : '';
+    h += '<option value="' + gpuList[g].id + '"' + sel + '>' + escH(gpuList[g].name) + '</option>';
+  }
+  h += '</select></div>';
+
+  /* progress */
+  var pct = Math.round(job.progress * 100);
+  h += '<div class="job-progress-row">';
+  h += '<div class="job-progress-bar-wrap"><div class="job-progress-bar" id="bar-' + job.id + '" style="width:' + pct + '%"></div></div>';
+  h += '<span class="job-pct" id="pct-' + job.id + '">' + pct + '%</span>';
+  h += '</div>';
+
+  /* stats */
+  h += '<div class="job-stats" id="stats-' + job.id + '">';
+  if (job.status === 'running') {
+    h += '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>';
+    h += '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>';
+    h += '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+  } else if (job.status === 'finished') {
+    h += '<span class="badge success">\u2713 Complete</span>';
+  } else if (job.status === 'failed') {
+    h += '<span class="badge error">\u2717 Failed</span>';
+  } else if (job.status === 'cancelled') {
+    h += '<span class="badge warning">\u2718 Cancelled</span>';
+  }
+  h += '</div>';
+
+  /* actions + log toggle */
+  h += '<div class="job-actions" id="actions-' + job.id + '">';
+  if (job.status === 'queued') {
+    h += '<button class="job-btn start" onclick="startJob(\'' + job.id + '\')">&#9654; Start</button>';
+  } else if (job.status === 'running') {
+    h += '<button class="job-btn cancel" onclick="cancelJob(\'' + job.id + '\')">Cancel</button>';
+  } else if (job.status === 'failed' || job.status === 'cancelled') {
+    h += '<button class="job-btn retry" onclick="startJob(\'' + job.id + '\')">&#8635; Retry</button>';
+    h += '<button class="job-btn remove" onclick="deleteJob(\'' + job.id + '\')">Remove</button>';
+  } else if (job.status === 'finished') {
+    h += '<button class="job-btn remove" onclick="deleteJob(\'' + job.id + '\')">Remove</button>';
+  }
+  if (job.log) {
+    h += '<span class="job-log-toggle" onclick="toggleLog(\'' + job.id + '\')">' + (expandedLogs[job.id] ? 'Hide Log' : 'Show Log') + '</span>';
+  }
+  h += '</div>';
+
+  /* log */
+  if (job.log && expandedLogs[job.id]) {
+    h += '<div class="job-log" id="log-' + job.id + '">' + escH(job.log) + '</div>';
+  }
+
+  h += '</div>';
+  return h;
+}
+
+function updateJobCard(job) {
+  var pct = Math.round(job.progress * 100);
+  var barEl = document.getElementById('bar-' + job.id);
+  if (barEl) barEl.style.width = pct + '%';
+  var pctEl = document.getElementById('pct-' + job.id);
+  if (pctEl) pctEl.textContent = pct + '%';
+
+  if (job.status === 'running') {
+    var statsEl = document.getElementById('stats-' + job.id);
+    if (statsEl) {
+      statsEl.innerHTML =
+        '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>' +
+        '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>' +
+        '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+    }
+  }
+
+  if (expandedLogs[job.id]) {
+    var logEl = document.getElementById('log-' + job.id);
+    if (logEl) {
+      logEl.textContent = job.log;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  }
+}
+
+/* ---------- job actions ---------- */
+
+function setJobGpu(jobId, value) {
+  for (var i = 0; i < jobsData.length; i++) {
+    if (jobsData[i].id === jobId) { jobsData[i].gpu = value; break; }
+  }
+}
+
+function startJob(jobId) {
+  var gpu = 'local';
+  var sel = document.getElementById('gpu-' + jobId);
+  if (sel) gpu = sel.value;
+  fetch('/api/jobs/' + jobId + '/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({gpu: gpu})
+  });
+  lastJobIds = '';
+}
+
+function cancelJob(jobId) {
+  fetch('/api/jobs/' + jobId + '/cancel', {method:'POST'});
+  lastJobIds = '';
+}
+
+function deleteJob(jobId) {
+  fetch('/api/jobs/' + jobId, {method:'DELETE'}).then(function() {
+    lastJobIds = '';
+    delete expandedLogs[jobId];
+  });
+}
+
+function startAllQueued() {
+  for (var i = 0; i < jobsData.length; i++) {
+    if (jobsData[i].status === 'queued') startJob(jobsData[i].id);
+  }
+}
+
+function clearCompleted() {
+  for (var i = 0; i < jobsData.length; i++) {
+    var s = jobsData[i].status;
+    if (s === 'finished' || s === 'failed' || s === 'cancelled') {
+      fetch('/api/jobs/' + jobsData[i].id, {method:'DELETE'});
+    }
+  }
+  lastJobIds = '';
+}
+
+function toggleLog(jobId) {
+  expandedLogs[jobId] = !expandedLogs[jobId];
+  lastJobIds = '';
+}
+
+/* ---------- cloud panel ---------- */
 
 function cpShowOnly(id) {
-  var ids = ['cpList','cpStep1','cpStep2','cpConnected','cpPassword','cpConnecting'];
+  var ids = ['cpList','cpStep1','cpStep2'];
   for (var i = 0; i < ids.length; i++) {
     document.getElementById(ids[i]).style.display = ids[i] === id ? 'block' : 'none';
   }
@@ -1133,11 +1448,7 @@ function toggleCloudPanel() {
   } else {
     panel.style.display = 'block';
     overlay.style.display = 'block';
-    if (remoteConnected) {
-      cpShowOnly('cpConnected');
-    } else {
-      showList();
-    }
+    showList();
   }
 }
 
@@ -1161,10 +1472,10 @@ function renderCards() {
     var g = gpuConfigs[i];
     var type = g.type === 'slurm' ? 'SLURM' : g.type === 'cloud' ? 'Cloud' : 'SSH';
     var proxy = g.proxy ? ' \u2192 ' + g.proxy : '';
-    html += '<div class="cloud-gpu-item" onclick="connectToGpu(' + i + ')">';
+    html += '<div class="cloud-gpu-item">';
     html += '<span class="cg-delete" onclick="event.stopPropagation();deleteGpu(' + i + ')">\u00d7</span>';
-    html += '<div class="cg-name">' + g.name + '</div>';
-    html += '<div class="cg-host">' + g.user + '@' + g.host + ':' + g.port + proxy + '</div>';
+    html += '<div class="cg-name">' + escH(g.name) + '</div>';
+    html += '<div class="cg-host">' + escH(g.user + '@' + g.host + ':' + g.port) + proxy + '</div>';
     html += '<span class="cg-tag">' + type + '</span>';
     if (g.auth === 'password') html += ' <span class="cg-tag">\u{1F511} password</span>';
     html += '</div>';
@@ -1187,7 +1498,7 @@ function showAddStep1() { cpShowOnly('cpStep1'); }
 function showAddStep2(type) {
   addingType = type;
   cpShowOnly('cpStep2');
-  var titles = {slurm: 'Add SLURM Cluster', direct: 'Add SSH GPU', cloud: 'Add Cloud GPU'};
+  var titles = {slurm:'Add SLURM Cluster', direct:'Add SSH GPU', cloud:'Add Cloud GPU'};
   document.getElementById('cpStep2Title').textContent = titles[type] || 'Configure';
 
   var html = '';
@@ -1197,11 +1508,12 @@ function showAddStep2(type) {
   html += '<div class="cp-field" style="max-width:80px"><label>Port</label><input id="af_port" type="number" value="22"></div>';
   html += '</div>';
   html += '<div class="cp-field"><label>Username</label><input id="af_user" placeholder="jdoe"></div>';
-  html += '<div class="cp-field"><label>Authentication</label><select id="af_auth">';
+  html += '<div class="cp-field"><label>Authentication</label><select id="af_auth" onchange="togglePasswordField()">';
   html += '<option value="key">SSH Key (~/.ssh/id_rsa)</option>';
-  html += '<option value="password">Password (prompt on connect)</option>';
+  html += '<option value="password">Password</option>';
   html += '<option value="agent">SSH Agent</option>';
   html += '</select></div>';
+  html += '<div class="cp-field" id="af_password_field" style="display:none"><label>Password</label><input id="af_password" type="password" placeholder="SSH password"></div>';
 
   if (type === 'slurm') {
     html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">SLURM Settings</div>';
@@ -1210,7 +1522,7 @@ function showAddStep2(type) {
     html += '<div class="cp-field"><label>GPU Resource</label><input id="af_gres" value="gpu:1"></div>';
     html += '<div class="cp-field"><label>Memory</label><input id="af_mem" value="32G"></div>';
     html += '</div>';
-    html += '<div class="cp-field"><label>Time Limit <span style="color:var(--text2);font-weight:400">(optional, e.g. 02:00:00)</span></label><input id="af_time" placeholder="no limit"></div>';
+    html += '<div class="cp-field"><label>Time Limit <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_time" placeholder="no limit"></div>';
     html += '<div class="cp-field-row">';
     html += '<div class="cp-field"><label>QoS <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_qos" placeholder="e.g. gpu_normal"></div>';
     html += '<div class="cp-field"><label>Nice <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_nice" placeholder="e.g. 10000"></div>';
@@ -1219,10 +1531,16 @@ function showAddStep2(type) {
   }
 
   html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">Advanced</div>';
-  html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional, e.g. user@login-node)</span></label><input id="af_proxy" placeholder="jdoe@login.hpc.university.edu"></div>';
+  html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_proxy" placeholder="jdoe@login.hpc.university.edu"></div>';
   html += '<div class="cp-field"><label>SSH Key Path <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_keypath" placeholder="~/.ssh/id_rsa"></div>';
 
   document.getElementById('cpFields').innerHTML = html;
+}
+
+function togglePasswordField() {
+  var auth = document.getElementById('af_auth').value;
+  var field = document.getElementById('af_password_field');
+  if (field) field.style.display = auth === 'password' ? 'block' : 'none';
 }
 
 function saveNewGpu() {
@@ -1232,13 +1550,13 @@ function saveNewGpu() {
   if (!name || !host || !user) { alert('Fill in name, host, and username.'); return; }
 
   var gpu = {
-    name: name,
-    type: addingType,
-    host: host,
+    name: name, type: addingType, host: host,
     port: parseInt(document.getElementById('af_port').value) || 22,
-    user: user,
-    auth: document.getElementById('af_auth').value,
+    user: user, auth: document.getElementById('af_auth').value
   };
+
+  var passEl = document.getElementById('af_password');
+  if (passEl && passEl.value) gpu.password = passEl.value;
 
   var proxyEl = document.getElementById('af_proxy');
   var keyEl = document.getElementById('af_keypath');
@@ -1268,100 +1586,25 @@ function saveNewGpu() {
   });
 }
 
-function connectToGpu(idx) {
-  var cfg = gpuConfigs[idx];
-  if (cfg.auth === 'password') {
-    pendingConfig = cfg;
-    cpShowOnly('cpPassword');
-    return;
-  }
-  doConnect(cfg);
-}
-
-function submitPassword() {
-  if (!pendingConfig) return;
-  pendingConfig.password = document.getElementById('sshPass').value;
-  doConnect(pendingConfig);
-  pendingConfig = null;
-}
-
-function doConnect(cfg) {
-  cpShowOnly('cpConnecting');
-  document.getElementById('cpConnectMsg').textContent = 'Connecting to ' + cfg.name + '...';
-
-  fetch('/api/remote/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.ok) {
-        remoteConnected = true;
-        computeMode = 'cloud';
-        remoteSlurm = d.slurm;
-        var gpu = d.gpu || 'GPU';
-        var sched = d.slurm ? ' | SLURM' : ' | Direct';
-        document.getElementById('cloudBadge').innerHTML = '\u{1F7E2} ' + cfg.name + ' \u2014 ' + gpu + sched;
-        document.getElementById('cloudIcon').classList.add('connected');
-        document.getElementById('gpuBadge').textContent = '\u{2601}\uFE0F ' + gpu;
-        cpShowOnly('cpConnected');
-        renderAction();
-      } else {
-        alert('Connection failed. Check the log for details.');
-        showList();
-      }
-    });
-}
-
-function disconnectRemote() {
-  fetch('/api/remote/disconnect', {method:'POST'});
-  remoteConnected = false;
-  computeMode = 'local';
-  document.getElementById('cloudIcon').classList.remove('connected');
-  document.getElementById('gpuBadge').textContent = '\u{1F7E2} Apple M3';
-  showList();
-  renderAction();
-}
-
-function startRemoteProcessing() {
-  if (!inputPath || !remoteConnected) return;
-
-  var modelEl = document.getElementById('model');
-  var body = {
-    input: inputPath,
-    processor: selectedProc,
-    scale: scale,
-    multiplier: multiplier,
-    model: modelEl ? modelEl.value : '',
-    codec: document.getElementById('codec').value,
-    use_slurm: remoteSlurm,
-  };
-  if (selectedProc === 'libplacebo') {
-    body.width = parseInt(document.getElementById('outW') ? document.getElementById('outW').value : '3840');
-    body.height = parseInt(document.getElementById('outH') ? document.getElementById('outH').value : '2160');
-  }
-  fetch('/api/remote/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
-    .then(function() { renderAction(); });
-}
-
-function copyLog() {
-  var text = document.getElementById('logContent').textContent;
-  navigator.clipboard.writeText(text).then(function() {
-    var btn = event.target;
-    btn.textContent = 'Copied!';
-    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
-  });
-}
-
 document.addEventListener('DOMContentLoaded', init);
 </script>
 </body>
 </html>
 """
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     detect_devices()
     port = 52845
 
     threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        target=lambda: app.run(
+            host="127.0.0.1", port=port, debug=False, use_reloader=False
+        ),
         daemon=True,
     ).start()
     time.sleep(0.5)
@@ -1369,7 +1612,9 @@ if __name__ == "__main__":
     window = webview.create_window(
         "Video2X for Mac",
         f"http://127.0.0.1:{port}",
-        width=1000, height=720, min_size=(800, 600),
+        width=1200,
+        height=780,
+        min_size=(900, 600),
         confirm_close=True,
         js_api=js_api,
     )
