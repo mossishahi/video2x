@@ -212,28 +212,52 @@ class RemoteGPU:
                 self._log(f"Jump host connected.")
 
                 # Verify the hop works
-                # Try multiple SSH strategies for the internal hop
+                # Use SSH ControlMaster to establish ONE connection and reuse it.
+                # This avoids "too many auth failures" since only 1 auth exchange happens.
+                ctl_path = f"/tmp/.venhance_ssh_{host}"
                 base_opts = f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port}"
-                strategies = [
-                    f"SSH_AUTH_SOCK= ssh {base_opts} -o IdentitiesOnly=yes -o IdentityFile=~/.ssh/id_rsa {username}@{host}",
-                    f"SSH_AUTH_SOCK= ssh {base_opts} -o PubkeyAuthentication=no {username}@{host}",
-                    f"ssh {base_opts} {username}@{host}",
-                ]
+                ctl_opts = f"-o ControlPath={ctl_path}"
 
-                ssh_prefix = None
-                for strat in strategies:
-                    _, stdout, stderr = proxy_ssh.exec_command(f"{strat} 'echo HOP_OK'", timeout=10)
-                    out = stdout.read().decode()
-                    if "HOP_OK" in out:
-                        ssh_prefix = strat
-                        self._log(f"Internal hop method found.")
+                # Kill any stale control socket
+                proxy_ssh.exec_command(f"rm -f {ctl_path}")
+                time.sleep(0.3)
+
+                # Try to establish a ControlMaster with each key individually
+                keys = []
+                _, stdout, _ = proxy_ssh.exec_command("ls ~/.ssh/id_ed25519 ~/.ssh/id_rsa 2>/dev/null")
+                for line in stdout.read().decode().strip().split("\n"):
+                    if line.strip():
+                        keys.append(line.strip())
+
+                self._log(f"Establishing connection to {host}...")
+                connected_hop = False
+
+                for key in keys:
+                    self._log(f"  Trying key: {os.path.basename(key)}...")
+                    master_cmd = (
+                        f"SSH_AUTH_SOCK= ssh -f -N -o ControlMaster=yes {ctl_opts} {base_opts} "
+                        f"-o IdentitiesOnly=yes -o IdentityAgent=none -o IdentityFile={key} "
+                        f"-o PreferredAuthentications=publickey "
+                        f"{username}@{host} 2>&1; echo EXIT:$?"
+                    )
+                    _, stdout, _ = proxy_ssh.exec_command(master_cmd, timeout=10)
+                    result = stdout.read().decode()
+
+                    # Check if control socket was created
+                    _, stdout2, _ = proxy_ssh.exec_command(f"ssh -O check {ctl_opts} {username}@{host} 2>&1")
+                    check = stdout2.read().decode()
+                    if "running" in check.lower() or "pid" in check.lower():
+                        self._log(f"  Connected with {os.path.basename(key)}")
+                        connected_hop = True
                         break
-                    time.sleep(0.5)
+                    else:
+                        self._log(f"  Failed: {result.strip()[:80]}")
+                    time.sleep(0.3)
 
-                if not ssh_prefix:
-                    err = stderr.read().decode().strip().split("\n")
-                    err_short = [l for l in err if l.strip() and "warning" not in l.lower() and "==" not in l][-3:]
-                    raise Exception(f"Cannot reach {host}: " + " | ".join(err_short))
+                if not connected_hop:
+                    raise Exception(f"Cannot reach {host} from {proxy_host}. None of the SSH keys worked.")
+
+                ssh_prefix = f"ssh {ctl_opts} {base_opts} {username}@{host}"
                 # Use a relay that runs commands on the target via the proxy
                 self.ssh = _ProxyRelay(proxy_ssh, ssh_prefix)
                 self._log(f"Connected to {host} via {proxy_host}")
