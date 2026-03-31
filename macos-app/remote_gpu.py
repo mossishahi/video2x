@@ -524,8 +524,17 @@ class RemoteGPU:
             status = stdout.read().decode().strip()
 
             if status == "PENDING":
-                self._log(f"Job {job_id}: waiting in queue...")
+                self.state["stage"] = "Waiting in queue..."
                 continue
+            elif status == "RUNNING":
+                self.state["stage"] = "Processing on GPU..."
+                try:
+                    _, gstdout, _ = self.ssh.exec_command("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1")
+                    gu = gstdout.read().decode().strip()
+                    if gu.isdigit():
+                        self.state["remote_gpu_util"] = int(gu)
+                except Exception:
+                    pass
 
             # Read the job log for progress
             _, stdout, _ = self.ssh.exec_command(f"tail -c +{last_size} {log_path} 2>/dev/null")

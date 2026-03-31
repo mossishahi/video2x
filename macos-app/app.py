@@ -277,10 +277,9 @@ def run_remote_job(job, gpu_config):
 
     gpu_key = _gpu_key(gpu_config)
     pw = gpu_passwords.get(gpu_key)
-    auth_method = gpu_config.get("auth", "key")
-    job["log"] += f"Auth: {auth_method}, password cached: {'yes' if pw else 'no'}\n"
 
     try:
+        job["stage"] = "Connecting..."
         ok = rgpu.connect(
             host=gpu_config["host"],
             username=gpu_config.get("user", ""),
@@ -292,31 +291,39 @@ def run_remote_job(job, gpu_config):
         )
         if not ok:
             job["status"] = "failed"
+            job["stage"] = "Connection failed"
             return
 
+        job["stage"] = "Setting up..."
         if not rgpu.install_video2x():
             job["status"] = "failed"
+            job["stage"] = "Setup failed"
             rgpu.disconnect()
             return
 
+        job["stage"] = "Uploading video..."
         remote_path = rgpu.upload_video(job["input"])
-        job["log"] += "\n"
 
+        job["stage"] = "Submitting job..." if use_slurm else "Processing..."
         args_str = build_remote_args_str(job)
         result_path = rgpu.process_video(remote_path, args_str, use_slurm=use_slurm)
         if not result_path:
             job["status"] = "failed"
+            job["stage"] = "Processing failed"
             rgpu.disconnect()
             return
 
+        job["stage"] = "Downloading result..."
         os.makedirs(job["output_dir"], exist_ok=True)
         local_result = rgpu.download_result(result_path, job["output_dir"])
 
         job["status"] = "finished"
         job["progress"] = 1.0
-        job["log"] += f"\nDone! Saved to: {local_result}\n"
+        job["stage"] = "Complete"
+        job["output"] = local_result
     except Exception as e:
         job["status"] = "failed"
+        job["stage"] = "Error"
         job["log"] += f"\nRemote error: {e}\n"
     finally:
         try:
@@ -428,6 +435,8 @@ def add_jobs():
             "elapsed": "00:00:00",
             "remaining": "--:--:--",
             "log": "",
+            "stage": "",
+            "remote_gpu_util": 0,
         }
         jobs[job_id] = job
         added.append(job)
@@ -817,8 +826,11 @@ body{
 }
 .status-finished .job-pct{color:var(--success)}
 .job-stats{
-  display:flex;gap:16px;margin-top:8px;
+  display:flex;gap:16px;margin-top:8px;flex-wrap:wrap;align-items:center;
   font-size:12px;color:var(--text2);font-variant-numeric:tabular-nums;
+}
+.job-stage{
+  color:var(--accent);font-weight:600;font-style:italic;
 }
 .job-actions{display:flex;gap:8px;margin-top:10px}
 .job-btn{
@@ -872,6 +884,39 @@ body{
 .empty-sub{font-size:13px}
 
 /* ---- cloud panel ---- */
+.pw-overlay{
+  position:fixed;top:0;left:0;right:0;bottom:0;
+  background:rgba(0,0,0,.5);z-index:200;
+  display:flex;align-items:center;justify-content:center;
+}
+.pw-dialog{
+  background:var(--surface);border:1px solid rgba(255,255,255,.1);
+  border-radius:14px;padding:24px;width:360px;
+  box-shadow:0 16px 48px rgba(0,0,0,.6);
+}
+.pw-title{font-size:15px;font-weight:700;margin-bottom:16px}
+.pw-input-wrap{position:relative;margin-bottom:16px}
+.pw-input{
+  width:100%;padding:10px 40px 10px 12px;
+  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);
+  border-radius:8px;color:var(--text);font-size:14px;
+  letter-spacing:2px;
+}
+.pw-input:focus{outline:none;border-color:var(--accent)}
+.pw-eye{
+  position:absolute;right:10px;top:50%;transform:translateY(-50%);
+  cursor:pointer;font-size:18px;opacity:.5;user-select:none;
+}
+.pw-eye:hover{opacity:1}
+.pw-buttons{display:flex;gap:10px;justify-content:flex-end}
+.pw-btn{
+  padding:8px 20px;border-radius:8px;font-size:13px;font-weight:600;
+  cursor:pointer;border:none;
+}
+.pw-cancel{background:rgba(255,255,255,.08);color:var(--text2)}
+.pw-cancel:hover{background:rgba(255,255,255,.12)}
+.pw-ok{background:var(--accent);color:#fff}
+.pw-ok:hover{opacity:.9}
 .cloud-overlay{
   position:fixed;top:0;left:0;right:0;bottom:0;
   background:rgba(0,0,0,.3);z-index:99;
@@ -969,6 +1014,21 @@ body{
 
 <!-- ==================== CLOUD PANEL ==================== -->
 <div class="cloud-overlay" id="cloudOverlay" style="display:none" onclick="toggleCloudPanel()"></div>
+
+<!-- Password dialog -->
+<div class="pw-overlay" id="pwOverlay" style="display:none">
+  <div class="pw-dialog">
+    <div class="pw-title" id="pwTitle">Enter SSH Password</div>
+    <div class="pw-input-wrap">
+      <input type="password" id="pwInput" class="pw-input" placeholder="Password" onkeydown="if(event.key==='Enter')submitPwDialog()">
+      <span class="pw-eye" onmousedown="document.getElementById('pwInput').type='text'" onmouseup="document.getElementById('pwInput').type='password'" onmouseleave="document.getElementById('pwInput').type='password'">&#128065;</span>
+    </div>
+    <div class="pw-buttons">
+      <button class="pw-btn pw-cancel" onclick="cancelPwDialog()">Cancel</button>
+      <button class="pw-btn pw-ok" onclick="submitPwDialog()">Connect</button>
+    </div>
+  </div>
+</div>
 <div class="cloud-panel" id="cloudPanel" style="display:none">
 
   <div id="cpList">
@@ -1091,6 +1151,7 @@ var gpuConfigs = [];
 var addingType = '';
 var editingIndex = -1;
 var sessionPasswords = {};
+var pwCallback = null;
 var lastJobIds = '';
 var lastJobStates = {};
 var expandedLogs = {};
@@ -1265,16 +1326,27 @@ function startPolling() {
 }
 
 function updateGpuBadge(gu) {
-  if (!gu) return;
   var badge = document.getElementById('gpuBadge');
-  var hasRunning = false;
+  var cloudIcon = document.getElementById('cloudIcon');
+  var hasLocalRunning = false;
+  var hasRemoteRunning = false;
   for (var i = 0; i < jobsData.length; i++) {
-    if (jobsData[i].status === 'running' && jobsData[i].gpu === 'local') {
-      hasRunning = true; break;
+    if (jobsData[i].status === 'running') {
+      if (jobsData[i].gpu === 'local') hasLocalRunning = true;
+      else hasRemoteRunning = true;
     }
   }
-  if (hasRunning && gu.gpu_util > 0) {
+
+  if (hasLocalRunning && gu && gu.gpu_util > 0) {
     badge.textContent = '\u{1F7E2} Apple M3 \u2022 ' + gu.gpu_util + '%';
+  } else {
+    badge.textContent = '\u{1F7E2} Apple M3';
+  }
+
+  if (hasRemoteRunning) {
+    cloudIcon.classList.add('connected');
+  } else {
+    cloudIcon.classList.remove('connected');
   }
 }
 
@@ -1391,9 +1463,14 @@ function buildJobCardHTML(job) {
   /* stats */
   h += '<div class="job-stats" id="stats-' + job.id + '">';
   if (job.status === 'running') {
-    h += '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>';
-    h += '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>';
-    h += '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+    if (job.stage && job.fps <= 0) {
+      h += '<span class="job-stage">' + escH(job.stage) + '</span>';
+    } else {
+      h += '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>';
+      h += '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>';
+      h += '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+      if (job.stage) h += '<span class="job-stage">' + escH(job.stage) + '</span>';
+    }
   } else if (job.status === 'finished') {
     h += '<span class="badge success">\u2713 Complete</span>';
   } else if (job.status === 'failed') {
@@ -1437,10 +1514,17 @@ function updateJobCard(job) {
   if (job.status === 'running') {
     var statsEl = document.getElementById('stats-' + job.id);
     if (statsEl) {
-      statsEl.innerHTML =
-        '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>' +
-        '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>' +
-        '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+      var sh = '';
+      if (job.stage && job.fps <= 0) {
+        sh = '<span class="job-stage">' + escH(job.stage) + '</span>';
+      } else {
+        sh = '<span>FPS: ' + (job.fps > 0 ? job.fps.toFixed(1) : '--') + '</span>' +
+          '<span>Frame: ' + (job.total > 0 ? job.frame + '/' + job.total : '--') + '</span>' +
+          '<span>' + job.elapsed + ' / ' + job.remaining + '</span>';
+        if (job.stage) sh += '<span class="job-stage">' + escH(job.stage) + '</span>';
+        if (job.remote_gpu_util > 0) sh += '<span>GPU: ' + job.remote_gpu_util + '%</span>';
+      }
+      statsEl.innerHTML = sh;
     }
   }
 
@@ -1472,22 +1556,48 @@ function startJob(jobId) {
     var cachedKey = gpu + '_pw';
     var pw = sessionPasswords[cachedKey] || '';
     if (!pw) {
-      pw = prompt('Enter SSH password for ' + (gpuName || 'remote GPU') + ':');
-      if (pw === null) return;
-      sessionPasswords[cachedKey] = pw;
+      showPasswordDialog(gpuName || 'remote GPU', function(enteredPw) {
+        if (!enteredPw) return;
+        sessionPasswords[cachedKey] = enteredPw;
+        doStartJob(jobId, gpu, enteredPw);
+      });
+      return;
     }
-    fetch('/api/jobs/' + jobId + '/start', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({gpu: gpu, password: pw})
-    });
+    doStartJob(jobId, gpu, pw);
   } else {
-    fetch('/api/jobs/' + jobId + '/start', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({gpu: gpu})
-    });
+    doStartJob(jobId, gpu, '');
   }
+}
+
+function showPasswordDialog(gpuName, callback) {
+  pwCallback = callback;
+  document.getElementById('pwTitle').textContent = 'SSH Password for ' + gpuName;
+  document.getElementById('pwInput').value = '';
+  document.getElementById('pwOverlay').style.display = 'flex';
+  setTimeout(function() { document.getElementById('pwInput').focus(); }, 100);
+}
+
+function submitPwDialog() {
+  var pw = document.getElementById('pwInput').value;
+  document.getElementById('pwOverlay').style.display = 'none';
+  if (pwCallback) pwCallback(pw);
+  pwCallback = null;
+}
+
+function cancelPwDialog() {
+  document.getElementById('pwOverlay').style.display = 'none';
+  if (pwCallback) pwCallback(null);
+  pwCallback = null;
+}
+
+function doStartJob(jobId, gpu, pw) {
+  var body = {gpu: gpu};
+  if (pw) body.password = pw;
+  fetch('/api/jobs/' + jobId + '/start', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
   lastJobIds = '';
 }
 
