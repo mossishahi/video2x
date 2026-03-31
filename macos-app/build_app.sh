@@ -77,6 +77,11 @@ done
 # Copy models
 cp -R "$REPO_DIR/build/video2x-install/share/video2x/models/"* "$APP_BUNDLE/Contents/Resources/models/"
 
+# Copy app icon
+if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
+    cp "$SCRIPT_DIR/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+fi
+
 # Copy MoltenVK ICD
 mkdir -p "$APP_BUNDLE/Contents/Resources/vulkan/icd.d"
 cp /opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json "$APP_BUNDLE/Contents/Resources/vulkan/icd.d/"
@@ -113,6 +118,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <string>APPL</string>
     <key>CFBundleExecutable</key>
     <string>Video2X</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
