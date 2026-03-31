@@ -224,12 +224,29 @@ class RemoteGPU:
             except paramiko.ssh_exception.BadAuthenticationType as e:
                 allowed = e.allowed_types if hasattr(e, 'allowed_types') else []
                 self._log(f"Retrying with allowed types: {allowed}")
+
+                if proxy and self._proxy_ssh:
+                    sock = self._proxy_ssh.get_transport().open_channel(
+                        "direct-tcpip", (host, port), ("127.0.0.1", 0)
+                    )
+
                 transport = paramiko.Transport(sock if sock else (host, port))
-                transport.connect(username=username)
+                transport.start_client()
                 if "keyboard-interactive" in allowed and password:
-                    transport.auth_interactive(username, lambda *a: [password])
+                    def _kbd_handler(title, instructions, prompt_list):
+                        return [password] * len(prompt_list)
+                    transport.auth_interactive(username, _kbd_handler)
                 elif "publickey" in allowed:
-                    transport.auth_publickey(username, paramiko.Agent().get_keys()[0])
+                    agent_keys = paramiko.Agent().get_keys()
+                    if agent_keys:
+                        transport.auth_publickey(username, agent_keys[0])
+                    else:
+                        kp = os.path.expanduser(key_path) if key_path else os.path.expanduser("~/.ssh/id_rsa")
+                        pkey = paramiko.RSAKey.from_private_key_file(kp)
+                        transport.auth_publickey(username, pkey)
+                else:
+                    raise
+
                 self.ssh = paramiko.SSHClient()
                 self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
                 self.ssh._transport = transport
