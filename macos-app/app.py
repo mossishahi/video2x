@@ -1209,11 +1209,9 @@ function showAddStep2(type) {
     html += '<div class="cp-field"><label>Time Limit</label><input id="af_time" value="02:00:00"></div>';
   }
 
-  if (type === 'slurm' || type === 'cloud') {
-    html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">Advanced</div>';
-    html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_proxy" placeholder="user@bastion.host.com"></div>';
-    html += '<div class="cp-field"><label>SSH Key Path <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_keypath" placeholder="~/.ssh/id_rsa"></div>';
-  }
+  html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">Advanced</div>';
+  html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional, e.g. user@login-node)</span></label><input id="af_proxy" placeholder="jdoe@login.hpc.university.edu"></div>';
+  html += '<div class="cp-field"><label>SSH Key Path <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_keypath" placeholder="~/.ssh/id_rsa"></div>';
 
   document.getElementById('cpFields').innerHTML = html;
 }
