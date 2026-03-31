@@ -1596,6 +1596,7 @@ function deleteGpu(idx) {
     body: JSON.stringify({index: idx})
   }).then(function(r){return r.json()}).then(function(d) {
     gpuConfigs = d.configs;
+    lastJobIds = '';
     renderCards();
   });
 }
@@ -1713,6 +1714,7 @@ function saveNewGpu() {
     .then(function(r){return r.json()}).then(function(d) {
       gpuConfigs = d.configs;
       editingIndex = -1;
+      lastJobIds = '';
       showList();
     });
 }
