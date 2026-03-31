@@ -25,6 +25,7 @@ V2X_ENV = {
     "VK_ICD_FILENAMES": "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json",
     "DYLD_LIBRARY_PATH": f"{V2X_DIR}/build:{V2X_DIR}/build/video2x-install/lib:/opt/homebrew/lib",
 }
+ANSI_RE = re.compile(r'(\x1b\[[0-9;]*[a-zA-Z]|\x1b\[K|\[K)')
 PROGRESS_RE = re.compile(
     r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
 )
@@ -218,21 +219,20 @@ def run_local_job(job):
             threading.Thread(target=poll_gpu_utilization, daemon=True).start()
 
         for line in proc.stdout:
-            clean = line.replace("\x1b[K", "").replace("\r", "").strip()
+            clean = ANSI_RE.sub("", line).replace("\r", "").replace("\n", "").strip()
             if not clean:
                 continue
-            if "frame=" in clean and "fps=" in clean:
-                m = PROGRESS_RE.search(clean)
-                if m:
-                    job["frame"] = int(m.group(1))
-                    job["total"] = int(m.group(2))
-                    job["fps"] = float(m.group(4))
-                    job["elapsed"] = m.group(5)
-                    job["remaining"] = m.group(6).strip()
-                    if job["total"] > 0:
-                        job["progress"] = job["frame"] / job["total"]
+            m = PROGRESS_RE.search(clean)
+            if m:
+                job["frame"] = int(m.group(1))
+                job["total"] = int(m.group(2))
+                job["fps"] = float(m.group(4))
+                job["elapsed"] = m.group(5)
+                job["remaining"] = m.group(6).strip()
+                if job["total"] > 0:
+                    job["progress"] = job["frame"] / job["total"]
                 continue
-            if clean.startswith("[K") or clean.startswith("\x1b"):
+            if "frame=" in clean:
                 continue
             job["log"] += clean + "\n"
             if len(job["log"]) > 50000:

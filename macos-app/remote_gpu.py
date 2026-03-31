@@ -88,6 +88,7 @@ def save_gpu_configs(configs, path=None):
         raw.append(entry)
     with open(path, "w") as f:
         yaml.dump({"gpus": raw}, f, default_flow_style=False, sort_keys=False)
+ANSI_RE = re.compile(r'(\x1b\[[0-9;]*[a-zA-Z]|\x1b\[K|\[K)')
 PROGRESS_RE = re.compile(
     r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
 )
@@ -443,21 +444,20 @@ class RemoteGPU:
         for line in stdout:
             if self._cancel:
                 break
-            clean = line.replace("\x1b[K", "").replace("\r", "").strip()
+            clean = ANSI_RE.sub("", line).replace("\r", "").replace("\n", "").strip()
             if not clean:
                 continue
-            if "frame=" in clean and "fps=" in clean:
-                m = PROGRESS_RE.search(clean)
-                if m:
-                    self.state["frame"] = int(m.group(1))
-                    self.state["total"] = int(m.group(2))
-                    self.state["fps"] = float(m.group(4))
-                    self.state["elapsed"] = m.group(5)
-                    self.state["remaining"] = m.group(6).strip()
-                    if self.state["total"] > 0:
-                        self.state["progress"] = self.state["frame"] / self.state["total"]
+            m = PROGRESS_RE.search(clean)
+            if m:
+                self.state["frame"] = int(m.group(1))
+                self.state["total"] = int(m.group(2))
+                self.state["fps"] = float(m.group(4))
+                self.state["elapsed"] = m.group(5)
+                self.state["remaining"] = m.group(6).strip()
+                if self.state["total"] > 0:
+                    self.state["progress"] = self.state["frame"] / self.state["total"]
                 continue
-            if clean.startswith("[K") or clean.startswith("\x1b") or clean.startswith("+"):
+            if "frame=" in clean or clean.startswith("+"):
                 continue
             self._log(clean)
 
@@ -529,22 +529,20 @@ class RemoteGPU:
             last_size += len(new_data)
 
             for line in new_data.split("\n"):
-                clean = line.strip()
+                clean = ANSI_RE.sub("", line).replace("\r", "").strip()
                 if not clean:
                     continue
-                # Skip raw progress lines and escape codes
-                if "frame=" in clean and "fps=" in clean:
-                    m = PROGRESS_RE.search(clean)
-                    if m:
-                        self.state["frame"] = int(m.group(1))
-                        self.state["total"] = int(m.group(2))
-                        self.state["fps"] = float(m.group(4))
-                        self.state["elapsed"] = m.group(5)
-                        self.state["remaining"] = m.group(6).strip()
-                        if self.state["total"] > 0:
-                            self.state["progress"] = self.state["frame"] / self.state["total"]
+                m = PROGRESS_RE.search(clean)
+                if m:
+                    self.state["frame"] = int(m.group(1))
+                    self.state["total"] = int(m.group(2))
+                    self.state["fps"] = float(m.group(4))
+                    self.state["elapsed"] = m.group(5)
+                    self.state["remaining"] = m.group(6).strip()
+                    if self.state["total"] > 0:
+                        self.state["progress"] = self.state["frame"] / self.state["total"]
                     continue
-                if clean.startswith("[K") or clean.startswith("\x1b"):
+                if "frame=" in clean or clean.startswith("+"):
                     continue
                 if "V2X_EXIT_CODE:0" in clean:
                     self._log("Remote processing complete!")
