@@ -95,50 +95,44 @@ PROGRESS_RE = re.compile(
 INSTALL_SCRIPT = r"""
 set -e
 V2X_DIR="{v2x_dir}"
+BIN="$V2X_DIR/venhance"
+APPIMAGE="$V2X_DIR/venhance.AppImage"
 
-if [ -f "$V2X_DIR/build/venhance-install/bin/venhance" ]; then
+if [ -f "$BIN" ] || [ -f "$APPIMAGE" ]; then
     echo "INSTALL_OK"
     exit 0
 fi
 
 echo "INSTALL_STARTED"
-mkdir -p "$V2X_DIR"
+mkdir -p "$V2X_DIR/data"
 
-# Check basic dependencies
-for cmd in cmake ninja git ffprobe pkg-config; do
-    if ! command -v $cmd &>/dev/null; then
-        echo "MISSING_DEP:$cmd"
-    fi
-done
+# Download the prebuilt AppImage (~50MB, works on any Linux x86_64)
+echo "Downloading prebuilt binary..."
+RELEASE_URL="https://github.com/k4yt3x/video2x/releases/download/6.4.0/Video2X-x86_64.AppImage"
+curl -sL "$RELEASE_URL" -o "$APPIMAGE" 2>&1 || wget -q "$RELEASE_URL" -O "$APPIMAGE" 2>&1
 
-# Try loading common cluster modules
-module load cmake 2>/dev/null || true
-module load ninja 2>/dev/null || true
-module load ffmpeg 2>/dev/null || true
-module load gcc 2>/dev/null || true
-module load vulkan 2>/dev/null || true
-module load cuda 2>/dev/null || true
+chmod +x "$APPIMAGE"
 
-# Clone if needed
-if [ ! -f "$V2X_DIR/CMakeLists.txt" ]; then
-    git clone --depth 1 --recurse-submodules --shallow-submodules \
-        https://github.com/k4yt3x/video2x.git "$V2X_DIR" 2>/dev/null
-fi
-
+# Extract the AppImage (works even without FUSE, which many clusters lack)
+echo "Extracting..."
 cd "$V2X_DIR"
+"$APPIMAGE" --appimage-extract >/dev/null 2>&1 || true
 
-cmake -G Ninja -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=build/venhance-install \
-    -DVIDEO2X_USE_EXTERNAL_NCNN=OFF \
-    -DVIDEO2X_USE_EXTERNAL_SPDLOG=OFF \
-    -DVIDEO2X_USE_EXTERNAL_BOOST=OFF 2>&1
-
-cmake --build build --config Release --parallel $(nproc) --target install 2>&1
-
-mv build/venhance-install/bin/video2x build/venhance-install/bin/venhance 2>/dev/null
-
-echo "INSTALL_OK"
+# Create a wrapper that runs the extracted binary
+if [ -d "$V2X_DIR/squashfs-root" ]; then
+    cat > "$BIN" << 'WRAPPER'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export LD_LIBRARY_PATH="$DIR/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
+cd "$DIR/squashfs-root/usr/share/video2x"
+exec "$DIR/squashfs-root/usr/bin/video2x" "$@"
+WRAPPER
+    chmod +x "$BIN"
+    echo "INSTALL_OK"
+else
+    echo "INSTALL_FAILED: Could not extract AppImage"
+    exit 1
+fi
 """
 
 SLURM_WRAPPER = r"""#!/bin/bash
@@ -155,10 +149,9 @@ SLURM_WRAPPER = r"""#!/bin/bash
 module load cuda 2>/dev/null || true
 module load vulkan 2>/dev/null || true
 
-V2X="{v2x_dir}/build/venhance-install/bin/venhance"
-export LD_LIBRARY_PATH="{v2x_dir}/build:$LD_LIBRARY_PATH"
-
-cd "{v2x_dir}/build/venhance-install/share/video2x"
+export LD_LIBRARY_PATH="{v2x_dir}/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
+cd "{v2x_dir}/squashfs-root/usr/share/video2x"
+V2X="{v2x_dir}/squashfs-root/usr/bin/video2x"
 
 $V2X {args}
 
@@ -403,10 +396,9 @@ class RemoteGPU:
 
     def _process_direct(self, args, remote_output):
         """Run processing directly on the remote node."""
-        v2x_bin = f"{REMOTE_V2X_DIR}/build/venhance-install/bin/venhance"
-        models_dir = f"{REMOTE_V2X_DIR}/build/venhance-install/share/video2x"
+        v2x_bin = f"{REMOTE_V2X_DIR}/venhance"
 
-        cmd = f"cd {models_dir} && LD_LIBRARY_PATH={REMOTE_V2X_DIR}/build:$LD_LIBRARY_PATH {v2x_bin} {args}"
+        cmd = f"{v2x_bin} {args}"
         self._log(f"Starting remote processing...")
 
         _, stdout, _ = self.ssh.exec_command(f"bash -l -c '{_escape(cmd)}'", get_pty=True)
