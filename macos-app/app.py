@@ -836,8 +836,8 @@ body{
   color:var(--text2);margin-top:4px;
 }
 .cloud-gpu-item .cg-delete{
-  position:absolute;top:8px;right:10px;font-size:14px;
-  color:var(--text2);cursor:pointer;opacity:0;transition:opacity .15s;
+  position:absolute;top:8px;right:10px;font-size:16px;
+  color:var(--text2);cursor:pointer;opacity:1;padding:4px 8px;border-radius:4px;
   padding:2px 6px;border-radius:4px;
 }
 .cloud-gpu-item:hover .cg-delete{opacity:1}
@@ -1338,11 +1338,13 @@ function buildJobCardHTML(job) {
   }
   if (job.log) {
     h += '<span class="job-log-toggle" onclick="toggleLog(\'' + job.id + '\')">' + (expandedLogs[job.id] ? 'Hide Log' : 'Show Log') + '</span>';
+    h += '<span class="job-log-toggle" onclick="copyJobLog(\'' + job.id + '\')">Copy Log</span>';
   }
   h += '</div>';
 
-  /* log */
-  if (job.log && expandedLogs[job.id]) {
+  /* auto-expand log on failure, always show if expanded */
+  var showLog = expandedLogs[job.id] || job.status === 'failed';
+  if (job.log && showLog) {
     h += '<div class="job-log" id="log-' + job.id + '">' + escH(job.log) + '</div>';
   }
 
@@ -1427,6 +1429,15 @@ function clearCompleted() {
 function toggleLog(jobId) {
   expandedLogs[jobId] = !expandedLogs[jobId];
   lastJobIds = '';
+}
+
+function copyJobLog(jobId) {
+  for (var i = 0; i < jobsData.length; i++) {
+    if (jobsData[i].id === jobId && jobsData[i].log) {
+      navigator.clipboard.writeText(jobsData[i].log);
+      return;
+    }
+  }
 }
 
 /* ---------- cloud panel ---------- */
