@@ -98,9 +98,16 @@ V2X_DIR="{v2x_dir}"
 SIF="$V2X_DIR/venhance.sif"
 BIN="$V2X_DIR/venhance"
 
+# Verify existing install actually works (not a stale broken wrapper)
 if [ -f "$BIN" ]; then
-    echo "INSTALL_OK"
-    exit 0
+    if $BIN --version >/dev/null 2>&1; then
+        echo "INSTALL_OK"
+        exit 0
+    else
+        echo "Existing install broken, reinstalling..."
+        rm -rf "$V2X_DIR"
+        mkdir -p "$V2X_DIR/data"
+    fi
 fi
 
 echo "INSTALL_STARTED"
