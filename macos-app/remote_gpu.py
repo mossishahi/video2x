@@ -174,6 +174,28 @@ class RemoteGPU:
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
+            def _auth_kwargs(target_auth, target_password, target_key_path):
+                """Build paramiko auth kwargs based on auth method."""
+                kw = {}
+                if target_auth == "password" and target_password:
+                    kw["password"] = target_password
+                    kw["allow_agent"] = False
+                    kw["look_for_keys"] = False
+                elif target_auth == "agent":
+                    kw["allow_agent"] = True
+                    kw["look_for_keys"] = False
+                elif target_auth == "key" and target_key_path:
+                    kp = os.path.expanduser(target_key_path)
+                    if os.path.isfile(kp):
+                        kw["key_filename"] = kp
+                    else:
+                        kw["allow_agent"] = True
+                        kw["look_for_keys"] = True
+                else:
+                    kw["allow_agent"] = True
+                    kw["look_for_keys"] = True
+                return kw
+
             sock = None
             if proxy:
                 self._log(f"Connecting via jump host: {proxy}")
@@ -182,27 +204,18 @@ class RemoteGPU:
                 proxy_parts = proxy.split("@")
                 proxy_user = proxy_parts[0] if len(proxy_parts) > 1 else username
                 proxy_host = proxy_parts[-1]
-                proxy_ssh.connect(hostname=proxy_host, username=proxy_user, timeout=15,
-                                  allow_agent=True, look_for_keys=True)
+                proxy_kw = {"hostname": proxy_host, "username": proxy_user, "timeout": 15}
+                proxy_kw.update(_auth_kwargs(auth, password, key_path))
+                proxy_ssh.connect(**proxy_kw)
                 transport = proxy_ssh.get_transport()
                 sock = transport.open_channel("direct-tcpip", (host, port), ("127.0.0.1", 0))
                 self._proxy_ssh = proxy_ssh
+                self._log(f"Jump host connected. Tunneling to {host}:{port}...")
 
             kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
             if sock:
                 kwargs["sock"] = sock
-            if auth == "password" and password:
-                kwargs["password"] = password
-            elif auth == "agent":
-                kwargs["allow_agent"] = True
-                kwargs["look_for_keys"] = False
-            else:
-                kp = os.path.expanduser(key_path) if key_path else os.path.expanduser("~/.ssh/id_rsa")
-                if os.path.isfile(kp):
-                    kwargs["key_filename"] = kp
-                else:
-                    kwargs["allow_agent"] = True
-                    kwargs["look_for_keys"] = True
+            kwargs.update(_auth_kwargs(auth, password, key_path))
             self.ssh.connect(**kwargs)
             self.connected = True
             self._log(f"Connected to {username}@{host}")
