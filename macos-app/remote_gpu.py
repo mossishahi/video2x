@@ -527,32 +527,32 @@ class RemoteGPU:
                 clean = line.strip()
                 if not clean:
                     continue
-                m = PROGRESS_RE.search(clean)
-                if m:
-                    self.state["frame"] = int(m.group(1))
-                    self.state["total"] = int(m.group(2))
-                    self.state["fps"] = float(m.group(4))
-                    self.state["elapsed"] = m.group(5)
-                    self.state["remaining"] = m.group(6).strip()
-                    if self.state["total"] > 0:
-                        self.state["progress"] = self.state["frame"] / self.state["total"]
-                elif "V2X_EXIT_CODE:0" in clean:
+                # Skip raw progress lines and escape codes
+                if "frame=" in clean and "fps=" in clean:
+                    m = PROGRESS_RE.search(clean)
+                    if m:
+                        self.state["frame"] = int(m.group(1))
+                        self.state["total"] = int(m.group(2))
+                        self.state["fps"] = float(m.group(4))
+                        self.state["elapsed"] = m.group(5)
+                        self.state["remaining"] = m.group(6).strip()
+                        if self.state["total"] > 0:
+                            self.state["progress"] = self.state["frame"] / self.state["total"]
+                    continue
+                if clean.startswith("[K") or clean.startswith("\x1b"):
+                    continue
+                if "V2X_EXIT_CODE:0" in clean:
                     self._log("Remote processing complete!")
                 elif "V2X_EXIT_CODE:" in clean:
                     self._log(f"Processing failed: {clean}")
-                else:
+                elif not clean.startswith("+"):
                     self._log(clean)
 
             # Check if job is done
             if not status or status in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"):
                 break
 
-        # Dump full job log
-        self._log(f"\n--- SLURM job {job_id} finished (status: {status or 'completed'}) ---")
-        _, stdout, _ = self.ssh.exec_command(f"cat {log_path} 2>/dev/null | tail -30")
-        tail = stdout.read().decode().strip()
-        if tail:
-            self._log(tail)
+        self._log(f"SLURM job {job_id} finished (status: {status or 'completed'})")
 
         # Verify output exists
         _, stdout, _ = self.ssh.exec_command(f"ls -la {remote_output} 2>&1")

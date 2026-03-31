@@ -513,6 +513,15 @@ def get_gpus():
     return jsonify(gpus=gpu_list)
 
 
+@app.route("/api/open-folder", methods=["POST"])
+def open_folder():
+    path = (request.json or {}).get("path", "")
+    if path:
+        folder = os.path.dirname(path) if os.path.isfile(path) else path
+        subprocess.Popen(["open", folder])
+    return jsonify(ok=True)
+
+
 @app.route("/api/output-dir", methods=["POST"])
 def set_output_dir():
     global output_dir
@@ -686,18 +695,22 @@ body{
 }
 
 /* ---- jobs area ---- */
-.jobs-toolbar{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:14px 20px 0;
+.tabs-bar{
+  display:flex;align-items:center;gap:0;
+  padding:0 20px;
+  border-bottom:1px solid rgba(255,255,255,.06);
+  background:var(--surface);
 }
-.jobs-count{font-size:13px;color:var(--text2);font-weight:600}
-.toolbar-btns{display:flex;gap:8px}
-.btn-toolbar{
-  padding:6px 14px;border:1px solid rgba(255,255,255,.1);border-radius:6px;
-  background:transparent;color:var(--text2);font-size:12px;cursor:pointer;
-  transition:all .15s;
+.tab{
+  padding:12px 18px;font-size:13px;font-weight:600;color:var(--text2);
+  cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;
 }
-.btn-toolbar:hover{border-color:var(--accent);color:var(--accent)}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-count{
+  font-size:11px;background:rgba(255,255,255,.08);padding:1px 7px;
+  border-radius:10px;margin-left:6px;
+}
 .btn-start-all{
   padding:6px 14px;border:none;border-radius:6px;
   background:linear-gradient(135deg,var(--accent),var(--accent2));
@@ -985,15 +998,14 @@ body{
 
   <!-- ---- content ---- -->
   <div class="content">
-    <div class="jobs-toolbar" id="jobsToolbar" style="display:none">
-      <span class="jobs-count" id="jobCount"></span>
-      <div class="toolbar-btns">
-        <button class="btn-toolbar" id="btnClear" onclick="clearCompleted()" style="display:none">Clear Done</button>
-        <button class="btn-start-all" id="btnStartAll" onclick="startAllQueued()" style="display:none">&#9654; Start All</button>
-      </div>
+    <div class="tabs-bar">
+      <div class="tab active" id="tabActive" onclick="switchTab('active')">Active <span class="tab-count" id="activeCount"></span></div>
+      <div class="tab" id="tabHistory" onclick="switchTab('history')">History <span class="tab-count" id="historyCount"></span></div>
+      <div style="flex:1"></div>
+      <button class="btn-start-all" id="btnStartAll" onclick="startAllQueued()" style="display:none">&#9654; Start All</button>
     </div>
     <div class="jobs-container" id="jobList">
-      <div class="empty-state">
+      <div class="empty-state" id="emptyState">
         <div class="empty-icon">&#127916;</div>
         <div class="empty-text">Add videos to get started</div>
         <div class="empty-sub">Select video files to add them to the processing queue</div>
@@ -1266,9 +1278,37 @@ function updateJobsUI() {
 
 function renderJobList() {
   var container = document.getElementById('jobList');
-  var html = '';
+  var activeJobs = [];
+  var historyJobs = [];
   for (var i = 0; i < jobsData.length; i++) {
-    html += buildJobCardHTML(jobsData[i]);
+    var s = jobsData[i].status;
+    if (s === 'queued' || s === 'running' || s === 'cancelling') {
+      activeJobs.push(jobsData[i]);
+    } else {
+      historyJobs.push(jobsData[i]);
+    }
+  }
+
+  document.getElementById('activeCount').textContent = activeJobs.length || '';
+  document.getElementById('historyCount').textContent = historyJobs.length || '';
+
+  var visible = currentTab === 'active' ? activeJobs : historyJobs;
+  var startAll = document.getElementById('btnStartAll');
+  var hasQueued = false;
+  for (var i = 0; i < activeJobs.length; i++) {
+    if (activeJobs[i].status === 'queued') { hasQueued = true; break; }
+  }
+  startAll.style.display = hasQueued && currentTab === 'active' ? '' : 'none';
+
+  if (visible.length === 0) {
+    var msg = currentTab === 'active' ? 'No active jobs. Add videos to get started.' : 'No completed jobs yet.';
+    container.innerHTML = '<div class="empty-state"><div class="empty-icon">&#127916;</div><div class="empty-text">' + msg + '</div></div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < visible.length; i++) {
+    html += buildJobCardHTML(visible[i]);
   }
   container.innerHTML = html;
 }
@@ -1347,16 +1387,12 @@ function buildJobCardHTML(job) {
     h += '<button class="job-btn remove" onclick="deleteJob(\'' + job.id + '\')">Remove</button>';
   }
   if (job.log) {
-    h += '<span class="job-log-toggle" onclick="toggleLog(\'' + job.id + '\')">' + (expandedLogs[job.id] ? 'Hide Log' : 'Show Log') + '</span>';
-    h += '<span class="job-log-toggle" onclick="copyJobLog(\'' + job.id + '\')">Copy Log</span>';
+    h += '<span class="job-log-toggle" onclick="openLogWindow(\'' + job.id + '\')">View Log</span>';
+  }
+  if (job.status === 'finished' && job.output) {
+    h += '<span class="job-log-toggle" onclick="openOutputFolder(\'' + job.id + '\')">Open Folder</span>';
   }
   h += '</div>';
-
-  /* auto-expand log on failure, always show if expanded */
-  var showLog = expandedLogs[job.id] || job.status === 'failed';
-  if (job.log && showLog) {
-    h += '<div class="job-log" id="log-' + job.id + '">' + escH(job.log) + '</div>';
-  }
 
   h += '</div>';
   return h;
@@ -1379,12 +1415,10 @@ function updateJobCard(job) {
     }
   }
 
-  if (expandedLogs[job.id]) {
-    var logEl = document.getElementById('log-' + job.id);
-    if (logEl) {
-      logEl.textContent = job.log;
-      logEl.scrollTop = logEl.scrollHeight;
-    }
+  // Status changes require full re-render
+  var cardEl = document.getElementById('job-' + job.id);
+  if (cardEl && cardEl.className.indexOf('status-' + job.status) === -1) {
+    lastJobIds = '';
   }
 }
 
@@ -1453,15 +1487,36 @@ function clearCompleted() {
   lastJobIds = '';
 }
 
-function toggleLog(jobId) {
-  expandedLogs[jobId] = !expandedLogs[jobId];
+var currentTab = 'active';
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('tabActive').className = tab === 'active' ? 'tab active' : 'tab';
+  document.getElementById('tabHistory').className = tab === 'history' ? 'tab active' : 'tab';
   lastJobIds = '';
 }
 
-function copyJobLog(jobId) {
+function openLogWindow(jobId) {
+  var job = null;
   for (var i = 0; i < jobsData.length; i++) {
-    if (jobsData[i].id === jobId && jobsData[i].log) {
-      navigator.clipboard.writeText(jobsData[i].log);
+    if (jobsData[i].id === jobId) { job = jobsData[i]; break; }
+  }
+  if (!job || !job.log) return;
+  var w = window.open('', 'log_' + jobId, 'width=800,height=500');
+  if (!w) return;
+  w.document.write('<html><head><title>Log: ' + escH(job.input_name) + '</title>');
+  w.document.write('<style>body{background:#1a1a2e;color:#aab;font-family:SF Mono,Menlo,monospace;font-size:12px;padding:16px;white-space:pre-wrap;word-break:break-all;line-height:1.6}');
+  w.document.write('.copy{position:fixed;top:10px;right:10px;background:#e94560;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px}</style></head><body>');
+  w.document.write('<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'l\').textContent)">Copy</button>');
+  w.document.write('<pre id="l">' + escH(job.log) + '</pre></body></html>');
+  w.document.close();
+}
+
+function openOutputFolder(jobId) {
+  for (var i = 0; i < jobsData.length; i++) {
+    if (jobsData[i].id === jobId && jobsData[i].output) {
+      fetch('/api/open-folder', {method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({path: jobsData[i].output})});
       return;
     }
   }
