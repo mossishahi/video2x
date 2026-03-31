@@ -43,7 +43,10 @@ def load_gpu_configs(path=None):
                 "partition": slurm.get("partition", ""),
                 "gres": slurm.get("gres", "gpu:1"),
                 "mem": slurm.get("mem", "32G"),
-                "time_limit": slurm.get("time", "02:00:00"),
+                "time_limit": slurm.get("time", ""),
+                "qos": slurm.get("qos", ""),
+                "nice": slurm.get("nice", ""),
+                "extra_sbatch": slurm.get("extra_sbatch", ""),
             })
         return configs
     except Exception as e:
@@ -75,6 +78,9 @@ def save_gpu_configs(configs, path=None):
             if c.get("gres"): slurm["gres"] = c["gres"]
             if c.get("mem"): slurm["mem"] = c["mem"]
             if c.get("time_limit"): slurm["time"] = c["time_limit"]
+            if c.get("qos"): slurm["qos"] = c["qos"]
+            if c.get("nice"): slurm["nice"] = c["nice"]
+            if c.get("extra_sbatch"): slurm["extra_sbatch"] = c["extra_sbatch"]
             if slurm:
                 entry["slurm"] = slurm
         else:
@@ -139,8 +145,11 @@ SLURM_WRAPPER = r"""#!/bin/bash
 #SBATCH --job-name=vproc
 #SBATCH --gres={gres}
 #SBATCH --mem={mem}
-#SBATCH --time={time_limit}
+{time_line}
 {partition_line}
+{qos_line}
+{nice_line}
+{extra_sbatch}
 #SBATCH --output={v2x_dir}/data/job_%j.log
 
 module load cuda 2>/dev/null || true
@@ -426,12 +435,23 @@ class RemoteGPU:
         """Submit as SLURM job and poll for completion."""
         gres = self.slurm_opts.get("gres", "gpu:1")
         mem = self.slurm_opts.get("mem", "32G")
-        time_limit = self.slurm_opts.get("time", "02:00:00")
+        time_limit = self.slurm_opts.get("time", "")
         partition = self.slurm_opts.get("partition", "")
+        qos = self.slurm_opts.get("qos", "")
+        nice = self.slurm_opts.get("nice", "")
+        extra = self.slurm_opts.get("extra_sbatch", "")
+
+        time_line = f"#SBATCH --time={time_limit}" if time_limit else ""
         partition_line = f"#SBATCH --partition={partition}" if partition else ""
+        qos_line = f"#SBATCH --qos={qos}" if qos else ""
+        nice_line = f"#SBATCH --nice={nice}" if nice else ""
+        extra_sbatch = "\n".join(f"#SBATCH {e.strip()}" for e in extra.split(",") if e.strip()) if extra else ""
+
         script = SLURM_WRAPPER.format(
             v2x_dir=REMOTE_V2X_DIR, args=args,
-            gres=gres, mem=mem, time_limit=time_limit, partition_line=partition_line,
+            gres=gres, mem=mem, time_line=time_line,
+            partition_line=partition_line, qos_line=qos_line,
+            nice_line=nice_line, extra_sbatch=extra_sbatch,
         )
         script_path = f"{REMOTE_V2X_DIR}/data/run_proc.sh"
 

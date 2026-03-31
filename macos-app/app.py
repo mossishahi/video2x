@@ -1210,7 +1210,12 @@ function showAddStep2(type) {
     html += '<div class="cp-field"><label>GPU Resource</label><input id="af_gres" value="gpu:1"></div>';
     html += '<div class="cp-field"><label>Memory</label><input id="af_mem" value="32G"></div>';
     html += '</div>';
-    html += '<div class="cp-field"><label>Time Limit</label><input id="af_time" value="02:00:00"></div>';
+    html += '<div class="cp-field"><label>Time Limit <span style="color:var(--text2);font-weight:400">(optional, e.g. 02:00:00)</span></label><input id="af_time" placeholder="no limit"></div>';
+    html += '<div class="cp-field-row">';
+    html += '<div class="cp-field"><label>QoS <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_qos" placeholder="e.g. gpu_normal"></div>';
+    html += '<div class="cp-field"><label>Nice <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_nice" placeholder="e.g. 10000"></div>';
+    html += '</div>';
+    html += '<div class="cp-field"><label>Extra sbatch flags <span style="color:var(--text2);font-weight:400">(comma-separated)</span></label><input id="af_extra" placeholder="e.g. --exclude=node01,--constraint=a100"></div>';
   }
 
   html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">Advanced</div>';
@@ -1245,7 +1250,14 @@ function saveNewGpu() {
     if (p && p.value.trim()) gpu.partition = p.value.trim();
     gpu.gres = document.getElementById('af_gres').value.trim() || 'gpu:1';
     gpu.mem = document.getElementById('af_mem').value.trim() || '32G';
-    gpu.time_limit = document.getElementById('af_time').value.trim() || '02:00:00';
+    var timeVal = document.getElementById('af_time').value.trim();
+    if (timeVal) gpu.time_limit = timeVal;
+    var qosVal = document.getElementById('af_qos').value.trim();
+    if (qosVal) gpu.qos = qosVal;
+    var niceVal = document.getElementById('af_nice').value.trim();
+    if (niceVal) gpu.nice = niceVal;
+    var extraVal = document.getElementById('af_extra').value.trim();
+    if (extraVal) gpu.extra_sbatch = extraVal;
   }
 
   fetch('/api/remote/configs/save', {method:'POST', headers:{'Content-Type':'application/json'},
