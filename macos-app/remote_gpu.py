@@ -207,10 +207,12 @@ class RemoteGPU:
             def _auth_kwargs(target_auth, target_password, target_key_path):
                 """Build paramiko auth kwargs based on auth method."""
                 kw = {}
-                if target_auth == "password" and target_password:
-                    kw["password"] = target_password
+                if target_auth == "password":
+                    if target_password:
+                        kw["password"] = target_password
                     kw["allow_agent"] = False
                     kw["look_for_keys"] = False
+                    return kw
                 elif target_auth == "agent":
                     kw["allow_agent"] = True
                     kw["look_for_keys"] = False
@@ -306,7 +308,7 @@ class RemoteGPU:
                         raise
             self.connected = True
             self._log(f"Connected to {username}@{host}")
-            time.sleep(1)
+            time.sleep(0.5)
 
             # Resolve ~ to actual home directory
             _, stdout, _ = self.ssh.exec_command("echo $HOME")

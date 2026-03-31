@@ -273,7 +273,10 @@ def run_remote_job(job, gpu_config):
     }
     use_slurm = gpu_config.get("type", "direct") == "slurm"
 
-    pw = gpu_passwords.get(_gpu_key(gpu_config))
+    gpu_key = _gpu_key(gpu_config)
+    pw = gpu_passwords.get(gpu_key)
+    auth_method = gpu_config.get("auth", "key")
+    job["log"] += f"Auth: {auth_method}, password cached: {'yes' if pw else 'no'}\n"
 
     try:
         ok = rgpu.connect(
