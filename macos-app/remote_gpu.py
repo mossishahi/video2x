@@ -189,6 +189,13 @@ class RemoteGPU:
         self._cancel = False
         self.slurm_opts = {}
 
+    def _resolve_path(self, path):
+        """Replace ~ with actual home directory."""
+        home = getattr(self, '_remote_home', None)
+        if home and path.startswith("~"):
+            return path.replace("~", home, 1)
+        return path
+
     def _log(self, msg):
         self.state["log"] += msg + "\n"
         if len(self.state["log"]) > 50000:
@@ -303,6 +310,16 @@ class RemoteGPU:
             self._log(f"Connected to {username}@{host}")
             time.sleep(1)
 
+            # Resolve ~ to actual home directory
+            _, stdout, _ = self.ssh.exec_command("echo $HOME")
+            raw = stdout.read()
+            home = (raw.decode().strip() if isinstance(raw, bytes) else raw.strip())
+            if home:
+                self._remote_home = home
+                self._log(f"Home: {home}")
+            else:
+                self._remote_home = f"/home/{username}"
+
             def _read(stdout):
                 raw = stdout.read()
                 return raw.decode().strip() if isinstance(raw, bytes) else raw.strip()
@@ -342,7 +359,7 @@ class RemoteGPU:
     def install_video2x(self):
         """Install processing engine on the remote machine if not present."""
         self._log("Checking remote installation...")
-        script = INSTALL_SCRIPT.replace("{v2x_dir}", REMOTE_V2X_DIR)
+        script = INSTALL_SCRIPT.replace("{v2x_dir}", self._resolve_path(REMOTE_V2X_DIR))
         _, stdout, stderr = self.ssh.exec_command(f"bash -l <<'VENHANCE_EOF'\n{script}\nVENHANCE_EOF", get_pty=True)
 
         for line in stdout:
@@ -365,7 +382,7 @@ class RemoteGPU:
     def upload_video(self, local_path):
         """Upload video to remote via SCP."""
         filename = os.path.basename(local_path)
-        remote_dir = f"{REMOTE_V2X_DIR}/data"
+        remote_dir = f"{self._resolve_path(REMOTE_V2X_DIR)}/data"
         self.ssh.exec_command(f"mkdir -p {remote_dir}")
         time.sleep(0.5)
 
@@ -403,10 +420,11 @@ class RemoteGPU:
         self.state["upload_progress"] = pct
 
     def process_video(self, remote_input, args_str, use_slurm=False):
-        """Run video2x on the remote machine."""
+        """Run processing on the remote machine."""
+        v2x_dir = self._resolve_path(REMOTE_V2X_DIR)
         filename = os.path.basename(remote_input)
         base, ext = os.path.splitext(filename)
-        remote_output = f"{REMOTE_V2X_DIR}/data/{base}_upscaled{ext}"
+        remote_output = f"{v2x_dir}/data/{base}_upscaled{ext}"
 
         full_args = f'-i "{remote_input}" -o "{remote_output}" {args_str}'
 
@@ -417,7 +435,7 @@ class RemoteGPU:
 
     def _process_direct(self, args, remote_output):
         """Run processing directly on the remote node."""
-        v2x_bin = f"{REMOTE_V2X_DIR}/venhance"
+        v2x_bin = f"{self._resolve_path(REMOTE_V2X_DIR)}/venhance"
 
         cmd = f"{v2x_bin} {args}"
         self._log(f"Starting remote processing...")
@@ -460,15 +478,16 @@ class RemoteGPU:
         nice_line = f"#SBATCH --nice={nice}" if nice else ""
         extra_sbatch = "\n".join(f"#SBATCH {e.strip()}" for e in extra.split(",") if e.strip()) if extra else ""
 
+        v2x_dir = self._resolve_path(REMOTE_V2X_DIR)
         script = SLURM_WRAPPER.format(
-            v2x_dir=REMOTE_V2X_DIR, args=args,
+            v2x_dir=v2x_dir, args=args,
             gres=gres, mem=mem, time_line=time_line,
             partition_line=partition_line, qos_line=qos_line,
             nice_line=nice_line, extra_sbatch=extra_sbatch,
         )
-        script_path = f"{REMOTE_V2X_DIR}/data/run_proc.sh"
+        script_path = f"{v2x_dir}/data/run_proc.sh"
 
-        self.ssh.exec_command(f"mkdir -p {REMOTE_V2X_DIR}/data")
+        self.ssh.exec_command(f"mkdir -p {v2x_dir}/data")
         time.sleep(0.5)
 
         # Write the script via echo to avoid SFTP issues
@@ -490,7 +509,7 @@ class RemoteGPU:
         job_id = job_match.group(1)
         self._log(f"Job {job_id} submitted. Waiting...")
 
-        log_path = f"{REMOTE_V2X_DIR}/data/job_{job_id}.log"
+        log_path = f"{v2x_dir}/data/job_{job_id}.log"
         last_size = 0
 
         while not self._cancel:
