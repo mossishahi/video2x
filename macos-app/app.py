@@ -480,16 +480,25 @@ def cancel_job(job_id):
     if not job:
         return jsonify(error="Job not found"), 404
 
-    p = active_processes.pop(job_id, None)
-    if p:
-        if p["type"] == "local":
-            p["proc"].terminate()
-            try:
-                p["proc"].wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                p["proc"].kill()
-        elif p["type"] == "remote":
-            p["rgpu"]._cancel = True
+    try:
+        p = active_processes.pop(job_id, None)
+        if p:
+            if p["type"] == "local":
+                try:
+                    p["proc"].terminate()
+                    p["proc"].wait(timeout=3)
+                except Exception:
+                    try:
+                        p["proc"].kill()
+                    except Exception:
+                        pass
+            elif p["type"] == "remote":
+                try:
+                    p["rgpu"].cancel()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     job["status"] = "cancelled"
     job["log"] += "\nCancelled by user.\n"

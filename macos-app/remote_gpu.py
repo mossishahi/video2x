@@ -184,6 +184,7 @@ class RemoteGPU:
         self.connected = False
         self._cancel = False
         self.slurm_opts = {}
+        self._slurm_job_id = None
 
     def _resolve_path(self, path):
         """Replace ~ with actual home directory."""
@@ -504,6 +505,7 @@ class RemoteGPU:
             self._log("Failed to get SLURM job ID")
             return None
         job_id = job_match.group(1)
+        self._slurm_job_id = job_id
         self._log(f"Job {job_id} submitted. Waiting...")
 
         log_path = f"{v2x_dir}/data/job_{job_id}.log"
@@ -596,6 +598,12 @@ class RemoteGPU:
 
     def cancel(self):
         self._cancel = True
+        if self._slurm_job_id and self.ssh:
+            try:
+                self.ssh.exec_command(f"scancel {self._slurm_job_id}")
+                self._log(f"Sent scancel for job {self._slurm_job_id}")
+            except Exception:
+                pass
 
 
 class _ProxyRelay:
