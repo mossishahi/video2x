@@ -26,8 +26,9 @@ V2X_ENV = {
     "DYLD_LIBRARY_PATH": f"{V2X_DIR}/build:{V2X_DIR}/build/video2x-install/lib:/opt/homebrew/lib",
 }
 ANSI_RE = re.compile(r'(\x1b\[[0-9;]*[a-zA-Z]|\x1b\[K|\[K)')
+SPLIT_RE = re.compile(r'[\r\n]+')
 PROGRESS_RE = re.compile(
-    r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
+    r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(\S+)"
 )
 
 # ---------------------------------------------------------------------------
@@ -218,25 +219,26 @@ def run_local_job(job):
         if not gpu_poll_active:
             threading.Thread(target=poll_gpu_utilization, daemon=True).start()
 
-        for line in proc.stdout:
-            clean = ANSI_RE.sub("", line).replace("\r", "").replace("\n", "").strip()
-            if not clean:
-                continue
-            m = PROGRESS_RE.search(clean)
-            if m:
-                job["frame"] = int(m.group(1))
-                job["total"] = int(m.group(2))
-                job["fps"] = float(m.group(4))
-                job["elapsed"] = m.group(5)
-                job["remaining"] = m.group(6).strip()
-                if job["total"] > 0:
-                    job["progress"] = job["frame"] / job["total"]
-                continue
-            if "frame=" in clean:
-                continue
-            job["log"] += clean + "\n"
-            if len(job["log"]) > 50000:
-                job["log"] = job["log"][-40000:]
+        for raw_line in proc.stdout:
+            for line in SPLIT_RE.split(raw_line):
+                clean = ANSI_RE.sub("", line).strip()
+                if not clean:
+                    continue
+                m = PROGRESS_RE.search(clean)
+                if m:
+                    job["frame"] = int(m.group(1))
+                    job["total"] = int(m.group(2))
+                    job["fps"] = float(m.group(4))
+                    job["elapsed"] = m.group(5)
+                    job["remaining"] = m.group(6).strip()
+                    if job["total"] > 0:
+                        job["progress"] = job["frame"] / job["total"]
+                    continue
+                if "frame=" in clean:
+                    continue
+                job["log"] += clean + "\n"
+                if len(job["log"]) > 50000:
+                    job["log"] = job["log"][-40000:]
 
         proc.wait()
         if proc.returncode == 0:

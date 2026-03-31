@@ -90,8 +90,9 @@ def save_gpu_configs(configs, path=None):
         yaml.dump({"gpus": raw}, f, default_flow_style=False, sort_keys=False)
 ANSI_RE = re.compile(r'(\x1b\[[0-9;]*[a-zA-Z]|\x1b\[K|\[K)')
 PROGRESS_RE = re.compile(
-    r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
+    r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(\S+)"
 )
+SPLIT_RE = re.compile(r'[\r\n]+')
 
 INSTALL_SCRIPT = r"""
 set -e
@@ -443,25 +444,26 @@ class RemoteGPU:
 
         _, stdout, _ = self.ssh.exec_command(f"bash -l -c '{_escape(cmd)}'", get_pty=True)
 
-        for line in stdout:
+        for raw_line in stdout:
             if self._cancel:
                 break
-            clean = ANSI_RE.sub("", line).replace("\r", "").replace("\n", "").strip()
-            if not clean:
-                continue
-            m = PROGRESS_RE.search(clean)
-            if m:
-                self.state["frame"] = int(m.group(1))
-                self.state["total"] = int(m.group(2))
-                self.state["fps"] = float(m.group(4))
-                self.state["elapsed"] = m.group(5)
-                self.state["remaining"] = m.group(6).strip()
-                if self.state["total"] > 0:
-                    self.state["progress"] = self.state["frame"] / self.state["total"]
-                continue
-            if "frame=" in clean or clean.startswith("+"):
-                continue
-            self._log(clean)
+            for line in SPLIT_RE.split(raw_line):
+                clean = ANSI_RE.sub("", line).strip()
+                if not clean:
+                    continue
+                m = PROGRESS_RE.search(clean)
+                if m:
+                    self.state["frame"] = int(m.group(1))
+                    self.state["total"] = int(m.group(2))
+                    self.state["fps"] = float(m.group(4))
+                    self.state["elapsed"] = m.group(5)
+                    self.state["remaining"] = m.group(6).strip()
+                    if self.state["total"] > 0:
+                        self.state["progress"] = self.state["frame"] / self.state["total"]
+                    continue
+                if "frame=" in clean or clean.startswith("+"):
+                    continue
+                self._log(clean)
 
         return remote_output
 
@@ -530,7 +532,7 @@ class RemoteGPU:
             new_data = stdout.read().decode()
             last_size += len(new_data)
 
-            for line in new_data.split("\n"):
+            for line in SPLIT_RE.split(new_data):
                 clean = ANSI_RE.sub("", line).replace("\r", "").strip()
                 if not clean:
                     continue
