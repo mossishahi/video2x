@@ -1496,10 +1496,10 @@ function buildJobCardHTML(job) {
     h += '<button class="job-btn remove" onclick="deleteJob(\'' + job.id + '\')">Remove</button>';
   }
   if (job.log) {
-    h += '<button class="job-btn" onclick="openLogWindow(\'' + job.id + '\')">View Log</button>';
+    h += '<button class="job-btn remove" onclick="openLogWindow(\'' + job.id + '\')">View Log</button>';
   }
   if (job.status === 'finished' && job.output) {
-    h += '<button class="job-btn" onclick="openOutputFolder(\'' + job.id + '\')">Open Folder</button>';
+    h += '<button class="job-btn remove" onclick="openOutputFolder(\'' + job.id + '\')">Open Folder</button>';
   }
   h += '</div>';
 
