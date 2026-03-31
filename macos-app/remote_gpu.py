@@ -212,16 +212,28 @@ class RemoteGPU:
                 self._log(f"Jump host connected.")
 
                 # Verify the hop works
-                ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o PreferredAuthentications=publickey,keyboard-interactive -p {port} {username}@{host}"
-                _, stdout, stderr = proxy_ssh.exec_command(f"{ssh_prefix} 'echo HOP_OK'", timeout=15)
-                out = stdout.read().decode()
-                err = stderr.read().decode()
-                if "HOP_OK" not in out:
-                    # Show only the last few lines of error, not the full MOTD
-                    err_lines = [l for l in (err + out).strip().split("\n") if l.strip() and "warning" not in l.lower() and "==" not in l]
-                    err_short = "\n".join(err_lines[-3:]) if err_lines else "unknown error"
-                    raise Exception(f"Cannot reach {host}: {err_short}")
+                # Try multiple SSH strategies for the internal hop
+                base_opts = f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port}"
+                strategies = [
+                    f"SSH_AUTH_SOCK= ssh {base_opts} -o IdentitiesOnly=yes -o IdentityFile=~/.ssh/id_rsa {username}@{host}",
+                    f"SSH_AUTH_SOCK= ssh {base_opts} -o PubkeyAuthentication=no {username}@{host}",
+                    f"ssh {base_opts} {username}@{host}",
+                ]
 
+                ssh_prefix = None
+                for strat in strategies:
+                    _, stdout, stderr = proxy_ssh.exec_command(f"{strat} 'echo HOP_OK'", timeout=10)
+                    out = stdout.read().decode()
+                    if "HOP_OK" in out:
+                        ssh_prefix = strat
+                        self._log(f"Internal hop method found.")
+                        break
+                    time.sleep(0.5)
+
+                if not ssh_prefix:
+                    err = stderr.read().decode().strip().split("\n")
+                    err_short = [l for l in err if l.strip() and "warning" not in l.lower() and "==" not in l][-3:]
+                    raise Exception(f"Cannot reach {host}: " + " | ".join(err_short))
                 # Use a relay that runs commands on the target via the proxy
                 self.ssh = _ProxyRelay(proxy_ssh, ssh_prefix)
                 self._log(f"Connected to {host} via {proxy_host}")

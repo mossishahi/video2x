@@ -547,6 +547,7 @@ body {
   font-family: 'SF Mono', 'Menlo', monospace;
   font-size: 12px; line-height: 1.6; color: var(--text2);
   white-space: pre-wrap; word-break: break-all;
+  user-select: text; -webkit-user-select: text;
 }
 .badge {
   display: inline-flex; align-items: center; gap: 6px;
@@ -842,7 +843,10 @@ body {
       </div>
     </div>
     <div class="log-area">
-      <div class="log-header">Log Output</div>
+      <div class="log-header">
+        <span>Log Output</span>
+        <span style="margin-left:auto;cursor:pointer;font-size:11px;padding:3px 10px;background:rgba(255,255,255,.08);border-radius:4px" onclick="copyLog()">Copy</span>
+      </div>
       <div class="log-content" id="logContent">Ready. Select a video and click Start Processing.</div>
     </div>
   </div>
@@ -1323,6 +1327,15 @@ function startRemoteProcessing() {
   }
   fetch('/api/remote/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
     .then(function() { renderAction(); });
+}
+
+function copyLog() {
+  var text = document.getElementById('logContent').textContent;
+  navigator.clipboard.writeText(text).then(function() {
+    var btn = event.target;
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+  });
 }
 
 document.addEventListener('DOMContentLoaded', init);
