@@ -264,7 +264,18 @@ class RemoteGPU:
             else:
                 kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
                 kwargs.update(_auth_kwargs(auth, password, key_path))
-                self.ssh.connect(**kwargs)
+                try:
+                    self.ssh.connect(**kwargs)
+                except paramiko.ssh_exception.BadAuthenticationType as e:
+                    allowed = getattr(e, 'allowed_types', [])
+                    if "keyboard-interactive" in allowed and password:
+                        self._log("Using keyboard-interactive auth...")
+                        transport = paramiko.Transport((host, port))
+                        transport.start_client()
+                        transport.auth_interactive(username, lambda *a: [password] * len(a[2]))
+                        self.ssh._transport = transport
+                    else:
+                        raise
             self.connected = True
             self._log(f"Connected to {username}@{host}")
             time.sleep(1)
