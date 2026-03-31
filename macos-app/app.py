@@ -594,6 +594,18 @@ def remote_config_save():
     return jsonify(ok=True, configs=load_gpu_configs())
 
 
+@app.route("/api/remote/configs/update", methods=["POST"])
+def remote_config_update():
+    data = request.json or {}
+    idx = data.get("index", -1)
+    gpu = data.get("gpu", {})
+    configs = load_gpu_configs()
+    if 0 <= idx < len(configs):
+        configs[idx] = gpu
+        save_gpu_configs(configs)
+    return jsonify(ok=True, configs=load_gpu_configs())
+
+
 @app.route("/api/remote/configs/delete", methods=["POST"])
 def remote_config_delete():
     idx = (request.json or {}).get("index", -1)
@@ -893,6 +905,11 @@ body{
 }
 .cloud-gpu-item:hover .cg-delete{opacity:1}
 .cloud-gpu-item .cg-delete:hover{color:var(--accent);background:rgba(233,69,96,.15)}
+.cloud-gpu-item .cg-edit{
+  position:absolute;top:8px;right:36px;font-size:14px;
+  color:var(--text2);cursor:pointer;opacity:1;padding:4px 8px;border-radius:4px;
+}
+.cloud-gpu-item .cg-edit:hover{color:var(--accent);background:rgba(233,69,96,.15)}
 .cloud-type-card{
   display:flex;align-items:center;gap:14px;
   padding:14px;border:1px solid rgba(255,255,255,.08);
@@ -983,7 +1000,7 @@ body{
       <div class="cloud-panel-title" style="margin:0" id="cpStep2Title">Configure</div>
     </div>
     <div id="cpFields"></div>
-    <button class="btn-primary" style="font-size:13px;padding:10px;margin-top:8px" onclick="saveNewGpu()">Add GPU</button>
+    <button class="btn-primary" style="font-size:13px;padding:10px;margin-top:8px" id="cpSaveBtn" onclick="saveNewGpu()">Add GPU</button>
   </div>
 </div>
 
@@ -1067,6 +1084,7 @@ var jobsData = [];
 var gpuList = [];
 var gpuConfigs = [];
 var addingType = '';
+var editingIndex = -1;
 var lastJobIds = '';
 var lastJobStates = {};
 var expandedLogs = {};
@@ -1560,10 +1578,13 @@ function renderCards() {
     var proxy = g.proxy ? ' \u2192 ' + g.proxy : '';
     html += '<div class="cloud-gpu-item">';
     html += '<span class="cg-delete" onclick="event.stopPropagation();deleteGpu(' + i + ')">\u00d7</span>';
+    html += '<span class="cg-edit" onclick="event.stopPropagation();editGpu(' + i + ')">&#9998;</span>';
     html += '<div class="cg-name">' + escH(g.name) + '</div>';
     html += '<div class="cg-host">' + escH(g.user + '@' + g.host + ':' + g.port) + proxy + '</div>';
     html += '<span class="cg-tag">' + type + '</span>';
     if (g.auth === 'password') html += ' <span class="cg-tag">\u{1F511} password</span>';
+    if (g.partition) html += ' <span class="cg-tag">p:' + escH(g.partition) + '</span>';
+    if (g.qos) html += ' <span class="cg-tag">qos:' + escH(g.qos) + '</span>';
     html += '</div>';
   }
   el.innerHTML = html;
@@ -1579,48 +1600,63 @@ function deleteGpu(idx) {
   });
 }
 
-function showAddStep1() { cpShowOnly('cpStep1'); }
+function showAddStep1() { editingIndex = -1; cpShowOnly('cpStep1'); }
 
-function showAddStep2(type) {
+function editGpu(idx) {
+  var g = gpuConfigs[idx];
+  if (!g) return;
+  editingIndex = idx;
+  addingType = g.type || 'direct';
+  showAddStep2(addingType, g);
+}
+
+function showAddStep2(type, prefill) {
   addingType = type;
+  if (!prefill) editingIndex = -1;
+  var pf = prefill || {};
   cpShowOnly('cpStep2');
-  var titles = {slurm:'Add SLURM Cluster', direct:'Add SSH GPU', cloud:'Add Cloud GPU'};
+  var isEdit = editingIndex >= 0;
+  var titles = {slurm:(isEdit?'Edit':'Add') + ' SLURM Cluster', direct:(isEdit?'Edit':'Add') + ' SSH GPU', cloud:(isEdit?'Edit':'Add') + ' Cloud GPU'};
   document.getElementById('cpStep2Title').textContent = titles[type] || 'Configure';
 
   var html = '';
-  html += '<div class="cp-field"><label>Name</label><input id="af_name" placeholder="e.g. Lab A100"></div>';
+  html += '<div class="cp-field"><label>Name</label><input id="af_name" placeholder="e.g. Lab A100" value="' + escH(pf.name || '') + '"></div>';
   html += '<div class="cp-field-row">';
-  html += '<div class="cp-field"><label>Host</label><input id="af_host" placeholder="cluster.uni.edu"></div>';
-  html += '<div class="cp-field" style="max-width:80px"><label>Port</label><input id="af_port" type="number" value="22"></div>';
+  html += '<div class="cp-field"><label>Host</label><input id="af_host" placeholder="cluster.uni.edu" value="' + escH(pf.host || '') + '"></div>';
+  html += '<div class="cp-field" style="max-width:80px"><label>Port</label><input id="af_port" type="number" value="' + (pf.port || 22) + '"></div>';
   html += '</div>';
-  html += '<div class="cp-field"><label>Username</label><input id="af_user" placeholder="jdoe"></div>';
+  html += '<div class="cp-field"><label>Username</label><input id="af_user" placeholder="jdoe" value="' + escH(pf.user || '') + '"></div>';
   html += '<div class="cp-field"><label>Authentication</label><select id="af_auth" onchange="togglePasswordField()">';
-  html += '<option value="key">SSH Key (~/.ssh/id_rsa)</option>';
-  html += '<option value="password">Password</option>';
-  html += '<option value="agent">SSH Agent</option>';
+  var authOpts = [{v:'key',l:'SSH Key (~/.ssh/id_rsa)'},{v:'password',l:'Password'},{v:'agent',l:'SSH Agent'}];
+  for (var a = 0; a < authOpts.length; a++) {
+    var asel = (pf.auth || 'key') === authOpts[a].v ? ' selected' : '';
+    html += '<option value="' + authOpts[a].v + '"' + asel + '>' + authOpts[a].l + '</option>';
+  }
   html += '</select></div>';
-  html += '<div class="cp-field" id="af_password_field" style="display:none"><label>Password</label><input id="af_password" type="password" placeholder="SSH password"></div>';
+  var pwShow = pf.auth === 'password' ? 'block' : 'none';
+  html += '<div class="cp-field" id="af_password_field" style="display:' + pwShow + '"><label>Password</label><input id="af_password" type="password" placeholder="SSH password"></div>';
 
   if (type === 'slurm') {
     html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">SLURM Settings</div>';
-    html += '<div class="cp-field"><label>Partition <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_partition" placeholder="gpu"></div>';
+    html += '<div class="cp-field"><label>Partition <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_partition" placeholder="gpu" value="' + escH(pf.partition || '') + '"></div>';
     html += '<div class="cp-field-row">';
-    html += '<div class="cp-field"><label>GPU Resource</label><input id="af_gres" value="gpu:1"></div>';
-    html += '<div class="cp-field"><label>Memory</label><input id="af_mem" value="32G"></div>';
+    html += '<div class="cp-field"><label>GPU Resource</label><input id="af_gres" value="' + escH(pf.gres || 'gpu:1') + '"></div>';
+    html += '<div class="cp-field"><label>Memory</label><input id="af_mem" value="' + escH(pf.mem || '32G') + '"></div>';
     html += '</div>';
-    html += '<div class="cp-field"><label>Time Limit <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_time" placeholder="no limit"></div>';
+    html += '<div class="cp-field"><label>Time Limit <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_time" placeholder="no limit" value="' + escH(pf.time_limit || '') + '"></div>';
     html += '<div class="cp-field-row">';
-    html += '<div class="cp-field"><label>QoS <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_qos" placeholder="e.g. gpu_normal"></div>';
-    html += '<div class="cp-field"><label>Nice <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_nice" placeholder="e.g. 10000"></div>';
+    html += '<div class="cp-field"><label>QoS <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_qos" placeholder="e.g. gpu_normal" value="' + escH(pf.qos || '') + '"></div>';
+    html += '<div class="cp-field"><label>Nice <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_nice" placeholder="e.g. 10000" value="' + escH(pf.nice || '') + '"></div>';
     html += '</div>';
-    html += '<div class="cp-field"><label>Extra sbatch flags <span style="color:var(--text2);font-weight:400">(comma-separated)</span></label><input id="af_extra" placeholder="e.g. --exclude=node01,--constraint=a100"></div>';
+    html += '<div class="cp-field"><label>Extra sbatch flags <span style="color:var(--text2);font-weight:400">(comma-separated)</span></label><input id="af_extra" placeholder="e.g. --exclude=node01,--constraint=a100" value="' + escH(pf.extra_sbatch || '') + '"></div>';
   }
 
   html += '<div style="margin:14px 0 8px;font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.5px">Advanced</div>';
-  html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_proxy" placeholder="jdoe@login.hpc.university.edu"></div>';
-  html += '<div class="cp-field"><label>SSH Key Path <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_keypath" placeholder="~/.ssh/id_rsa"></div>';
+  html += '<div class="cp-field"><label>Jump Host / Proxy <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_proxy" placeholder="jdoe@login.hpc.university.edu" value="' + escH(pf.proxy || '') + '"></div>';
+  html += '<div class="cp-field"><label>SSH Key Path <span style="color:var(--text2);font-weight:400">(optional)</span></label><input id="af_keypath" placeholder="~/.ssh/id_rsa" value="' + escH(pf.key_path || '') + '"></div>';
 
   document.getElementById('cpFields').innerHTML = html;
+  document.getElementById('cpSaveBtn').textContent = isEdit ? 'Save Changes' : 'Add GPU';
 }
 
 function togglePasswordField() {
@@ -1664,12 +1700,21 @@ function saveNewGpu() {
     if (extraVal) gpu.extra_sbatch = extraVal;
   }
 
-  fetch('/api/remote/configs/save', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(gpu)
-  }).then(function(r){return r.json()}).then(function(d) {
-    gpuConfigs = d.configs;
-    showList();
-  });
+  var url, body;
+  if (editingIndex >= 0) {
+    url = '/api/remote/configs/update';
+    body = JSON.stringify({index: editingIndex, gpu: gpu});
+  } else {
+    url = '/api/remote/configs/save';
+    body = JSON.stringify(gpu);
+  }
+
+  fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body})
+    .then(function(r){return r.json()}).then(function(d) {
+      gpuConfigs = d.configs;
+      editingIndex = -1;
+      showList();
+    });
 }
 
 document.addEventListener('DOMContentLoaded', init);
