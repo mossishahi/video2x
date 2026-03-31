@@ -1199,6 +1199,7 @@ function addFiles(paths) {
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify(body)
   }).then(function(r){return r.json()}).then(function() {
+    switchTab('active');
     lastJobIds = '';
   });
 }
@@ -1237,39 +1238,15 @@ function updateGpuBadge(gu) {
 /* ---------- job list rendering ---------- */
 
 function updateJobsUI() {
-  var container = document.getElementById('jobList');
-  var toolbar = document.getElementById('jobsToolbar');
-
-  if (jobsData.length === 0) {
-    toolbar.style.display = 'none';
-    container.innerHTML = '<div class="empty-state">' +
-      '<div class="empty-icon">&#127916;</div>' +
-      '<div class="empty-text">Add videos to get started</div>' +
-      '<div class="empty-sub">Select video files to add them to the processing queue</div></div>';
-    lastJobIds = '';
-    lastJobStates = {};
-    return;
-  }
-
   var needFullRender = false;
   var currentIds = [];
-  var hasQueued = false;
-  var hasDone = false;
   for (var i = 0; i < jobsData.length; i++) {
     var j = jobsData[i];
-    currentIds.push(j.id);
+    currentIds.push(j.id + ':' + j.status);
     if (lastJobStates[j.id] !== j.status) needFullRender = true;
-    if (j.status === 'queued') hasQueued = true;
-    if (j.status === 'finished' || j.status === 'failed' || j.status === 'cancelled') hasDone = true;
   }
   var idsStr = currentIds.join(',');
   if (idsStr !== lastJobIds) needFullRender = true;
-
-  // toolbar
-  toolbar.style.display = 'flex';
-  document.getElementById('jobCount').textContent = jobsData.length + (jobsData.length === 1 ? ' job' : ' jobs');
-  document.getElementById('btnStartAll').style.display = hasQueued ? 'inline-block' : 'none';
-  document.getElementById('btnClear').style.display = hasDone ? 'inline-block' : 'none';
 
   if (needFullRender) {
     renderJobList();
