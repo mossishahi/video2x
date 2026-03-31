@@ -95,10 +95,10 @@ PROGRESS_RE = re.compile(
 INSTALL_SCRIPT = r"""
 set -e
 V2X_DIR="{v2x_dir}"
+SIF="$V2X_DIR/venhance.sif"
 BIN="$V2X_DIR/venhance"
-APPIMAGE="$V2X_DIR/venhance.AppImage"
 
-if [ -f "$BIN" ] || [ -f "$APPIMAGE" ]; then
+if [ -f "$BIN" ]; then
     echo "INSTALL_OK"
     exit 0
 fi
@@ -106,50 +106,43 @@ fi
 echo "INSTALL_STARTED"
 mkdir -p "$V2X_DIR/data"
 
-# Download the prebuilt AppImage (~50MB, works on any Linux x86_64)
-echo "Downloading prebuilt binary..."
-RELEASE_URL="https://github.com/k4yt3x/video2x/releases/download/6.4.0/Video2X-x86_64.AppImage"
+# Method 1: Singularity/Apptainer (best for HPC)
+if command -v singularity &>/dev/null || command -v apptainer &>/dev/null; then
+    SING=$(command -v singularity 2>/dev/null || command -v apptainer)
+    echo "Using Singularity: $SING"
+    echo "Pulling container image (this takes 1-2 minutes)..."
+    $SING pull --force "$SIF" docker://ghcr.io/k4yt3x/video2x:6.4.0 2>&1
 
-if command -v curl &>/dev/null; then
-    curl -fSL --retry 3 "$RELEASE_URL" -o "$APPIMAGE" 2>&1
-elif command -v wget &>/dev/null; then
-    wget --tries=3 "$RELEASE_URL" -O "$APPIMAGE" 2>&1
-else
-    echo "INSTALL_FAILED: Neither curl nor wget available"
-    exit 1
+    if [ -f "$SIF" ]; then
+        cat > "$BIN" << WRAPPER
+#!/bin/bash
+$SING run --nv "\$(dirname "\$0")/venhance.sif" "\$@"
+WRAPPER
+        chmod +x "$BIN"
+        echo "INSTALL_OK"
+        exit 0
+    else
+        echo "Singularity pull failed, trying Docker..."
+    fi
 fi
 
-# Verify it actually downloaded (not an HTML error page)
-FILE_SIZE=$(stat -c%s "$APPIMAGE" 2>/dev/null || stat -f%z "$APPIMAGE" 2>/dev/null || echo 0)
-echo "Downloaded: ${FILE_SIZE} bytes"
-if [ "$FILE_SIZE" -lt 1000000 ]; then
-    echo "INSTALL_FAILED: Download too small (${FILE_SIZE} bytes), likely failed"
-    cat "$APPIMAGE" 2>/dev/null | head -5
-    exit 1
-fi
+# Method 2: Docker
+if command -v docker &>/dev/null; then
+    echo "Using Docker..."
+    docker pull ghcr.io/k4yt3x/video2x:6.4.0 2>&1
 
-chmod +x "$APPIMAGE"
-
-# Extract the AppImage (works even without FUSE, which many clusters lack)
-echo "Extracting..."
-cd "$V2X_DIR"
-"$APPIMAGE" --appimage-extract 2>&1
-
-# Create a wrapper that runs the extracted binary
-if [ -d "$V2X_DIR/squashfs-root" ]; then
     cat > "$BIN" << 'WRAPPER'
 #!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-export LD_LIBRARY_PATH="$DIR/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
-cd "$DIR/squashfs-root/usr/share/video2x"
-exec "$DIR/squashfs-root/usr/bin/video2x" "$@"
+docker run --gpus all --rm -v "$(dirname "$1"):/host" ghcr.io/k4yt3x/video2x:6.4.0 "$@"
 WRAPPER
     chmod +x "$BIN"
     echo "INSTALL_OK"
-else
-    echo "INSTALL_FAILED: Could not extract AppImage"
-    exit 1
+    exit 0
 fi
+
+echo "INSTALL_FAILED: Neither Singularity/Apptainer nor Docker found on this system."
+echo "Ask your cluster admin to install Singularity, or load it via: module load singularity"
+exit 1
 """
 
 SLURM_WRAPPER = r"""#!/bin/bash
@@ -163,18 +156,14 @@ SLURM_WRAPPER = r"""#!/bin/bash
 {extra_sbatch}
 #SBATCH --output={v2x_dir}/data/job_%j.log
 
-set -x
 module load cuda 2>/dev/null || true
 module load vulkan 2>/dev/null || true
-
-V2X_DIR="{v2x_dir}"
-export LD_LIBRARY_PATH="$V2X_DIR/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
-cd "$V2X_DIR/squashfs-root/usr/share/video2x"
+module load singularity 2>/dev/null || true
 
 echo "Running on $(hostname) with GPU:"
 nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "No GPU found"
 
-"$V2X_DIR/squashfs-root/usr/bin/video2x" {args}
+"{v2x_dir}/venhance" {args}
 
 echo "V2X_EXIT_CODE:$?"
 """
@@ -435,9 +424,10 @@ class RemoteGPU:
 
     def _process_direct(self, args, remote_output):
         """Run processing directly on the remote node."""
-        v2x_bin = f"{self._resolve_path(REMOTE_V2X_DIR)}/venhance"
+        v2x_dir = self._resolve_path(REMOTE_V2X_DIR)
+        v2x_bin = f"{v2x_dir}/venhance"
 
-        cmd = f"{v2x_bin} {args}"
+        cmd = f"module load singularity 2>/dev/null; {v2x_bin} {args}"
         self._log(f"Starting remote processing...")
 
         _, stdout, _ = self.ssh.exec_command(f"bash -l -c '{_escape(cmd)}'", get_pty=True)
