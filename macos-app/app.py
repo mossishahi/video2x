@@ -204,6 +204,18 @@ class Api:
             return json.dumps({"path": result})
         return json.dumps({"path": ""})
 
+    def browse_config(self):
+        window = webview.windows[0]
+        result = window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            file_types=("YAML Config (*.yaml;*.yml)",),
+        )
+        if result and len(result) > 0:
+            path = result[0]
+            configs = load_gpu_configs(path)
+            return json.dumps({"path": path, "configs": configs})
+        return json.dumps({"path": "", "configs": []})
+
 
 js_api = Api()
 
@@ -614,12 +626,32 @@ body {
 <div class="cloud-overlay" id="cloudOverlay" style="display:none" onclick="toggleCloudPanel()"></div>
 <div class="cloud-panel" id="cloudPanel" style="display:none">
   <div class="cloud-panel-title">External GPUs</div>
-  <div id="cloudConfigInfo" style="font-size:11px;color:var(--text2);margin-bottom:12px"></div>
+
+  <div id="cloudConfigBar" style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+    <div id="cloudConfigPath" style="font-size:11px;color:var(--text2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">No config loaded</div>
+    <button onclick="browseConfig()" style="
+      padding:5px 12px; font-size:11px; font-weight:600;
+      background:var(--accent); color:#fff; border:none;
+      border-radius:6px; cursor:pointer; white-space:nowrap;
+    ">Load Config</button>
+  </div>
+
+  <div id="cloudEmpty" style="display:none;padding:16px;text-align:center;border:1px dashed rgba(255,255,255,.15);border-radius:8px">
+    <div style="font-size:13px;color:var(--text2);margin-bottom:10px">
+      No GPUs configured yet.<br>Click <b>Load Config</b> to select a <code>.yaml</code> file.
+    </div>
+    <div style="font-size:11px;color:var(--text2)">
+      See <code>gpu_config.example.yaml</code> for the format.
+    </div>
+  </div>
+
   <div id="cloudList"></div>
+
   <div id="cloudConnected" style="display:none">
     <div class="badge success" id="cloudBadge" style="font-size:12px;margin-bottom:8px"></div>
     <button class="btn-cancel" style="font-size:12px;padding:8px" onclick="disconnectRemote()">Disconnect</button>
   </div>
+
   <div id="cloudPasswordPrompt" style="display:none;margin-top:10px">
     <div class="setting-row">
       <label>Password</label>
@@ -993,40 +1025,59 @@ function toggleCloudPanel() {
 }
 
 function loadCloudConfigs() {
+  if (remoteConnected) {
+    document.getElementById('cloudList').style.display = 'none';
+    document.getElementById('cloudEmpty').style.display = 'none';
+    document.getElementById('cloudConnected').style.display = 'block';
+    return;
+  }
+  document.getElementById('cloudConnected').style.display = 'none';
+
+  // Try loading from default path first
   fetch('/api/remote/configs').then(function(r){return r.json()}).then(function(d) {
-    gpuConfigs = d.configs;
-    var el = document.getElementById('cloudList');
-    var info = document.getElementById('cloudConfigInfo');
-
-    if (remoteConnected) {
-      el.style.display = 'none';
-      document.getElementById('cloudConnected').style.display = 'block';
-      info.innerHTML = '';
-      return;
+    if (d.configs.length > 0) {
+      renderGpuList(d.configs, d.config_path);
+    } else {
+      document.getElementById('cloudList').style.display = 'none';
+      document.getElementById('cloudEmpty').style.display = 'block';
+      document.getElementById('cloudConfigPath').textContent = 'No config loaded';
     }
-    document.getElementById('cloudConnected').style.display = 'none';
-    el.style.display = 'block';
-
-    if (gpuConfigs.length === 0) {
-      info.innerHTML = 'No GPUs configured. Edit:<br><code style="font-size:10px;color:var(--accent)">' + d.config_path + '</code>';
-      el.innerHTML = '<div style="color:var(--text2);font-size:12px;padding:10px">See gpu_config.example.yaml for the format.</div>';
-      return;
-    }
-
-    info.innerHTML = 'Config: <code style="font-size:10px">' + d.config_path + '</code>';
-    var html = '';
-    for (var i = 0; i < gpuConfigs.length; i++) {
-      var g = gpuConfigs[i];
-      var sched = g.scheduler === 'slurm' ? 'SLURM' : g.scheduler === 'direct' ? 'Direct' : 'Auto';
-      var proxy = g.proxy ? ' \u2192 via ' + g.proxy : '';
-      html += '<div class="cloud-gpu-item" onclick="connectToGpu(' + i + ')">';
-      html += '<div class="cg-name">' + g.name + '</div>';
-      html += '<div class="cg-host">' + g.user + '@' + g.host + ':' + g.port + proxy + '</div>';
-      html += '<span class="cg-tag">' + sched + '</span>';
-      html += '</div>';
-    }
-    el.innerHTML = html;
   });
+}
+
+function browseConfig() {
+  if (!window.pywebview) {
+    alert('Use the file path input instead.');
+    return;
+  }
+  window.pywebview.api.browse_config().then(function(result) {
+    var d = JSON.parse(result);
+    if (d.path && d.configs.length > 0) {
+      renderGpuList(d.configs, d.path);
+    } else if (d.path) {
+      alert('No GPU entries found in that config file. Check the format.');
+    }
+  });
+}
+
+function renderGpuList(configs, configPath) {
+  gpuConfigs = configs;
+  document.getElementById('cloudEmpty').style.display = 'none';
+  document.getElementById('cloudList').style.display = 'block';
+  document.getElementById('cloudConfigPath').textContent = configPath;
+
+  var html = '';
+  for (var i = 0; i < gpuConfigs.length; i++) {
+    var g = gpuConfigs[i];
+    var sched = g.scheduler === 'slurm' ? 'SLURM' : g.scheduler === 'direct' ? 'Direct' : 'Auto';
+    var proxy = g.proxy ? ' \u2192 via ' + g.proxy : '';
+    html += '<div class="cloud-gpu-item" onclick="connectToGpu(' + i + ')">';
+    html += '<div class="cg-name">' + g.name + '</div>';
+    html += '<div class="cg-host">' + g.user + '@' + g.host + ':' + g.port + proxy + '</div>';
+    html += '<span class="cg-tag">' + sched + '</span>';
+    html += '</div>';
+  }
+  document.getElementById('cloudList').innerHTML = html;
 }
 
 function connectToGpu(idx) {
