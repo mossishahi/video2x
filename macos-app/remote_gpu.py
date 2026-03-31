@@ -244,20 +244,33 @@ class RemoteGPU:
                 self.ssh.connect(**kwargs)
             self.connected = True
             self._log(f"Connected to {username}@{host}")
+            time.sleep(1)
 
-            _, stdout, _ = self.ssh.exec_command("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1")
-            gpu_name = stdout.read().decode().strip()
-            if gpu_name:
-                self._log(f"Remote GPU: {gpu_name}")
-                self.state["remote_gpu_name"] = gpu_name
-            else:
-                self._log("Warning: No NVIDIA GPU detected on remote host.")
+            try:
+                _, stdout, _ = self.ssh.exec_command("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1")
+                raw = stdout.read()
+                gpu_name = raw if isinstance(raw, str) else raw.decode()
+                gpu_name = gpu_name.strip()
+                if gpu_name:
+                    self._log(f"Remote GPU: {gpu_name}")
+                    self.state["remote_gpu_name"] = gpu_name
+                else:
+                    self._log("Warning: No NVIDIA GPU detected on remote host.")
+                    self.state["remote_gpu_name"] = "Unknown"
+            except Exception as e:
+                self._log(f"GPU detection skipped: {e}")
                 self.state["remote_gpu_name"] = "Unknown"
 
-            _, stdout, _ = self.ssh.exec_command("command -v srun sbatch 2>/dev/null && echo HAS_SLURM || echo NO_SLURM")
-            has_slurm = "HAS_SLURM" in stdout.read().decode()
-            self.state["remote_has_slurm"] = has_slurm
-            self._log(f"SLURM: {'available' if has_slurm else 'not found (will run directly)'}")
+            try:
+                _, stdout, _ = self.ssh.exec_command("command -v srun sbatch 2>/dev/null && echo HAS_SLURM || echo NO_SLURM")
+                raw = stdout.read()
+                out = raw if isinstance(raw, str) else raw.decode()
+                has_slurm = "HAS_SLURM" in out
+                self.state["remote_has_slurm"] = has_slurm
+                self._log(f"SLURM: {'available' if has_slurm else 'not found (will run directly)'}")
+            except Exception as e:
+                self._log(f"SLURM detection skipped: {e}")
+                self.state["remote_has_slurm"] = False
 
             return True
         except Exception as e:
