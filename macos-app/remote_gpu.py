@@ -25,33 +25,63 @@ def load_gpu_configs(path=None):
         entries = data.get("gpus", [])
         configs = []
         for i, e in enumerate(entries):
+            sched = e.get("scheduler", "auto")
+            gpu_type = e.get("type", "slurm" if sched == "slurm" else "direct")
+            slurm = e.get("slurm", {})
             configs.append({
                 "id": i,
                 "name": e.get("name", e.get("host", f"GPU {i}")),
+                "type": gpu_type,
                 "host": e.get("host", ""),
                 "user": e.get("user", ""),
                 "port": int(e.get("port", 22)),
                 "auth": e.get("auth", "key"),
                 "key_path": e.get("key_path", ""),
                 "proxy": e.get("proxy", ""),
-                "scheduler": e.get("scheduler", "auto"),
-                "slurm": e.get("slurm", {}),
+                "scheduler": sched,
+                "slurm": slurm,
+                "partition": slurm.get("partition", ""),
+                "gres": slurm.get("gres", "gpu:1"),
+                "mem": slurm.get("mem", "32G"),
+                "time_limit": slurm.get("time", "02:00:00"),
             })
         return configs
     except Exception as e:
         return []
 
 
-def ensure_default_config():
-    """Create the default config directory and copy example if none exists."""
-    config_dir = os.path.dirname(DEFAULT_CONFIG_PATH)
-    os.makedirs(config_dir, exist_ok=True)
-    if not os.path.isfile(DEFAULT_CONFIG_PATH):
-        if os.path.isfile(EXAMPLE_CONFIG):
-            import shutil
-            shutil.copy(EXAMPLE_CONFIG, DEFAULT_CONFIG_PATH)
-            return True
-    return False
+def save_gpu_configs(configs, path=None):
+    """Save GPU configs back to YAML file."""
+    path = path or DEFAULT_CONFIG_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw = []
+    for c in configs:
+        entry = {
+            "name": c.get("name", ""),
+            "type": c.get("type", "direct"),
+            "host": c.get("host", ""),
+            "user": c.get("user", ""),
+            "port": int(c.get("port", 22)),
+            "auth": c.get("auth", "key"),
+        }
+        if c.get("key_path"):
+            entry["key_path"] = c["key_path"]
+        if c.get("proxy"):
+            entry["proxy"] = c["proxy"]
+        if c.get("type") == "slurm":
+            entry["scheduler"] = "slurm"
+            slurm = {}
+            if c.get("partition"): slurm["partition"] = c["partition"]
+            if c.get("gres"): slurm["gres"] = c["gres"]
+            if c.get("mem"): slurm["mem"] = c["mem"]
+            if c.get("time_limit"): slurm["time"] = c["time_limit"]
+            if slurm:
+                entry["slurm"] = slurm
+        else:
+            entry["scheduler"] = "direct"
+        raw.append(entry)
+    with open(path, "w") as f:
+        yaml.dump({"gpus": raw}, f, default_flow_style=False, sort_keys=False)
 PROGRESS_RE = re.compile(
     r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
 )
