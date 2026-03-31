@@ -559,8 +559,10 @@ pre{{margin-top:44px;user-select:text;-webkit-user-select:text}}</style></head><
 def open_folder():
     path = (request.json or {}).get("path", "")
     if path:
-        folder = os.path.dirname(path) if os.path.isfile(path) else path
-        subprocess.Popen(["open", folder])
+        if os.path.isfile(path):
+            subprocess.Popen(["open", "-R", path])
+        else:
+            subprocess.Popen(["open", path])
     return jsonify(ok=True)
 
 
@@ -683,6 +685,7 @@ body{
   border-radius:8px;transition:all .2s;margin-left:8px;color:var(--text2);
 }
 .cloud-icon:hover{background:rgba(255,255,255,.1);color:var(--accent)}
+.cloud-icon.connected{color:var(--success);text-shadow:0 0 8px rgba(74,222,128,.4)}
 
 /* ---- layout ---- */
 .main{display:flex;flex:1;overflow:hidden}
@@ -1493,10 +1496,10 @@ function buildJobCardHTML(job) {
     h += '<button class="job-btn remove" onclick="deleteJob(\'' + job.id + '\')">Remove</button>';
   }
   if (job.log) {
-    h += '<span class="job-log-toggle" onclick="openLogWindow(\'' + job.id + '\')">View Log</span>';
+    h += '<button class="job-btn" onclick="openLogWindow(\'' + job.id + '\')">View Log</button>';
   }
   if (job.status === 'finished' && job.output) {
-    h += '<span class="job-log-toggle" onclick="openOutputFolder(\'' + job.id + '\')">Open Folder</span>';
+    h += '<button class="job-btn" onclick="openOutputFolder(\'' + job.id + '\')">Open Folder</button>';
   }
   h += '</div>';
 
