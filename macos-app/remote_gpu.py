@@ -198,7 +198,6 @@ class RemoteGPU:
                     kw["look_for_keys"] = True
                 return kw
 
-            sock = None
             if proxy:
                 self._log(f"Connecting via jump host: {proxy}")
                 proxy_ssh = paramiko.SSHClient()
@@ -209,47 +208,40 @@ class RemoteGPU:
                 proxy_kw = {"hostname": proxy_host, "username": proxy_user, "timeout": 15}
                 proxy_kw.update(_auth_kwargs(auth, password, key_path))
                 proxy_ssh.connect(**proxy_kw)
-                transport = proxy_ssh.get_transport()
-                sock = transport.open_channel("direct-tcpip", (host, port), ("127.0.0.1", 0))
                 self._proxy_ssh = proxy_ssh
-                self._log(f"Jump host connected. Tunneling to {host}:{port}...")
+                self._log(f"Jump host connected. Hopping to {host}...")
 
-            kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
-            if sock:
-                kwargs["sock"] = sock
-            kwargs.update(_auth_kwargs(auth, password, key_path))
+                # Hop via ssh command on the login node (uses its internal keys)
+                hop_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port} {username}@{host}"
+                transport = proxy_ssh.get_transport()
+                chan = transport.open_session()
+                chan.get_pty()
+                chan.exec_command(hop_cmd)
 
-            try:
-                self.ssh.connect(**kwargs)
-            except paramiko.ssh_exception.BadAuthenticationType as e:
-                allowed = e.allowed_types if hasattr(e, 'allowed_types') else []
-                self._log(f"Retrying with allowed types: {allowed}")
-
-                if proxy and self._proxy_ssh:
-                    sock = self._proxy_ssh.get_transport().open_channel(
-                        "direct-tcpip", (host, port), ("127.0.0.1", 0)
-                    )
-
-                transport = paramiko.Transport(sock if sock else (host, port))
-                transport.start_client()
-                if "keyboard-interactive" in allowed and password:
-                    def _kbd_handler(title, instructions, prompt_list):
-                        return [password] * len(prompt_list)
-                    transport.auth_interactive(username, _kbd_handler)
-                elif "publickey" in allowed:
-                    agent_keys = paramiko.Agent().get_keys()
-                    if agent_keys:
-                        transport.auth_publickey(username, agent_keys[0])
+                # Wait for shell prompt or auth on the internal hop
+                import select
+                buf = ""
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    if chan.recv_ready():
+                        chunk = chan.recv(4096).decode("utf-8", errors="replace")
+                        buf += chunk
+                        lower = buf.lower()
+                        if "password:" in lower or "password for" in lower:
+                            chan.send(password + "\n")
+                            buf = ""
+                        elif "$" in buf[-20:] or ">" in buf[-20:] or "#" in buf[-20:] or "last login" in lower:
+                            break
                     else:
-                        kp = os.path.expanduser(key_path) if key_path else os.path.expanduser("~/.ssh/id_rsa")
-                        pkey = paramiko.RSAKey.from_private_key_file(kp)
-                        transport.auth_publickey(username, pkey)
-                else:
-                    raise
+                        time.sleep(0.2)
 
-                self.ssh = paramiko.SSHClient()
-                self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                self.ssh._transport = transport
+                # Wrap the channel as an SSHClient-like object
+                self.ssh = _ProxyShell(chan)
+                self._log(f"Connected to {host} via {proxy_host}")
+            else:
+                kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
+                kwargs.update(_auth_kwargs(auth, password, key_path))
+                self.ssh.connect(**kwargs)
             self.connected = True
             self._log(f"Connected to {username}@{host}")
 
@@ -311,11 +303,31 @@ class RemoteGPU:
         size_mb = os.path.getsize(local_path) / 1024 / 1024
         self._log(f"Uploading {filename} ({size_mb:.1f} MB)...")
 
-        with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
-            scp_client.put(local_path, f"{remote_dir}/{filename}")
+        if isinstance(self.ssh, _ProxyShell):
+            self._upload_via_proxy(local_path, f"{remote_dir}/{filename}")
+        else:
+            with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
+                scp_client.put(local_path, f"{remote_dir}/{filename}")
 
         self._log(f"Upload complete.")
         return f"{remote_dir}/{filename}"
+
+    def _upload_via_proxy(self, local_path, remote_path):
+        """Upload through the jump host using scp on the proxy."""
+        proxy = self._proxy_ssh
+        filename = os.path.basename(local_path)
+        tmp_path = f"/tmp/{filename}"
+        with SCPClient(proxy.get_transport(), progress=self._scp_progress) as scp_client:
+            scp_client.put(local_path, tmp_path)
+        # Now move from proxy to target
+        target_host = remote_path.split(":")[0] if ":" in remote_path else ""
+        self.ssh.exec_command(f"mkdir -p $(dirname {remote_path})")
+        time.sleep(0.3)
+        # Copy is already on the same node since _ProxyShell runs on the target
+        proxy.exec_command(f"scp -o StrictHostKeyChecking=no {tmp_path} $(hostname):{remote_path}")
+        time.sleep(1)
+        # Fallback: the file might already be accessible if proxy and target share filesystem
+        self.ssh.exec_command(f"cp {tmp_path} {remote_path} 2>/dev/null || true")
 
     def _scp_progress(self, filename, size, sent):
         pct = int(sent / size * 100) if size > 0 else 0
@@ -441,15 +453,100 @@ class RemoteGPU:
         local_path = os.path.join(local_dir, filename)
         self._log(f"Downloading {filename}...")
 
-        with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
-            scp_client.get(remote_path, local_path)
+        if isinstance(self.ssh, _ProxyShell):
+            self._download_via_proxy(remote_path, local_path)
+        else:
+            with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
+                scp_client.get(remote_path, local_path)
 
         size_mb = os.path.getsize(local_path) / 1024 / 1024
         self._log(f"Downloaded to {local_path} ({size_mb:.1f} MB)")
         return local_path
 
+    def _download_via_proxy(self, remote_path, local_path):
+        """Download through the jump host."""
+        proxy = self._proxy_ssh
+        filename = os.path.basename(remote_path)
+        tmp_path = f"/tmp/{filename}"
+        # Copy from target to proxy (shared filesystem or scp)
+        self.ssh.exec_command(f"cp {remote_path} {tmp_path} 2>/dev/null || true")
+        time.sleep(1)
+        proxy.exec_command(f"cp {remote_path} {tmp_path} 2>/dev/null || true")
+        time.sleep(1)
+        # Download from proxy to local
+        with SCPClient(proxy.get_transport(), progress=self._scp_progress) as scp_client:
+            scp_client.get(tmp_path, local_path)
+
     def cancel(self):
         self._cancel = True
+
+
+class _ProxyShell:
+    """Wraps an interactive SSH channel (hop via login node) to behave like paramiko.SSHClient."""
+
+    def __init__(self, channel):
+        self._chan = channel
+        self._lock = threading.Lock()
+
+    def exec_command(self, cmd, get_pty=False, timeout=None):
+        """Execute a command and return (stdin, stdout, stderr) file-like objects."""
+        import io, select as _sel
+
+        marker = f"__EXIT_{id(cmd)}__"
+        full_cmd = f"{cmd}; echo {marker}$?\n"
+
+        with self._lock:
+            # Drain any leftover output
+            while self._chan.recv_ready():
+                self._chan.recv(4096)
+
+            self._chan.send(full_cmd)
+            output = ""
+            deadline = time.time() + (timeout or 3600)
+
+            while time.time() < deadline:
+                if self._chan.recv_ready():
+                    chunk = self._chan.recv(65536).decode("utf-8", errors="replace")
+                    output += chunk
+                    if marker in output:
+                        break
+                else:
+                    time.sleep(0.1)
+
+        # Parse output: strip the command echo and marker
+        lines = output.split("\n")
+        result_lines = []
+        capture = False
+        exit_code = 0
+        for line in lines:
+            if marker in line:
+                try:
+                    exit_code = int(line.split(marker)[-1].strip())
+                except ValueError:
+                    pass
+                break
+            if capture:
+                result_lines.append(line)
+            elif full_cmd.strip()[:40] in line or cmd.strip()[:40] in line:
+                capture = True
+
+        stdout = io.StringIO("\n".join(result_lines))
+        stderr = io.StringIO("")
+        stdin = io.StringIO("")
+        return stdin, stdout, stderr
+
+    def open_sftp(self):
+        raise NotImplementedError("SFTP not available through proxy hop; using scp command instead.")
+
+    def get_transport(self):
+        return self._chan.get_transport()
+
+    def close(self):
+        try:
+            self._chan.send("exit\n")
+            self._chan.close()
+        except Exception:
+            pass
 
 
 def _escape(s):
