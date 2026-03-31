@@ -6,9 +6,52 @@ import threading
 import time
 
 import paramiko
+import yaml
 from scp import SCPClient
 
 REMOTE_V2X_DIR = "~/video2x_remote"
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/video2x/gpus.yaml")
+EXAMPLE_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_config.example.yaml")
+
+
+def load_gpu_configs(path=None):
+    """Load GPU target definitions from YAML config file."""
+    path = path or DEFAULT_CONFIG_PATH
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+        entries = data.get("gpus", [])
+        configs = []
+        for i, e in enumerate(entries):
+            configs.append({
+                "id": i,
+                "name": e.get("name", e.get("host", f"GPU {i}")),
+                "host": e.get("host", ""),
+                "user": e.get("user", ""),
+                "port": int(e.get("port", 22)),
+                "auth": e.get("auth", "key"),
+                "key_path": e.get("key_path", ""),
+                "proxy": e.get("proxy", ""),
+                "scheduler": e.get("scheduler", "auto"),
+                "slurm": e.get("slurm", {}),
+            })
+        return configs
+    except Exception as e:
+        return []
+
+
+def ensure_default_config():
+    """Create the default config directory and copy example if none exists."""
+    config_dir = os.path.dirname(DEFAULT_CONFIG_PATH)
+    os.makedirs(config_dir, exist_ok=True)
+    if not os.path.isfile(DEFAULT_CONFIG_PATH):
+        if os.path.isfile(EXAMPLE_CONFIG):
+            import shutil
+            shutil.copy(EXAMPLE_CONFIG, DEFAULT_CONFIG_PATH)
+            return True
+    return False
 PROGRESS_RE = re.compile(
     r"frame=(\d+)/(\d+)\s+\(([^)]+)\);\s+fps=([^;]+);\s+elapsed=([^;]+);\s+remaining=(.+)"
 )
@@ -62,9 +105,10 @@ echo "INSTALL_OK"
 
 SLURM_WRAPPER = r"""#!/bin/bash
 #SBATCH --job-name=video2x
-#SBATCH --gres=gpu:1
-#SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --gres={gres}
+#SBATCH --mem={mem}
+#SBATCH --time={time_limit}
+{partition_line}
 #SBATCH --output={v2x_dir}/data/job_%j.log
 
 module load cuda 2>/dev/null || true
@@ -85,26 +129,50 @@ class RemoteGPU:
     def __init__(self, state_dict):
         self.state = state_dict
         self.ssh = None
+        self._proxy_ssh = None
         self.connected = False
         self._cancel = False
+        self.slurm_opts = {}
 
     def _log(self, msg):
         self.state["log"] += msg + "\n"
         if len(self.state["log"]) > 50000:
             self.state["log"] = self.state["log"][-40000:]
 
-    def connect(self, host, username, password=None, key_path=None, port=22):
-        """Establish SSH connection."""
+    def connect(self, host, username, password=None, key_path=None, port=22, proxy=None, auth="key"):
+        """Establish SSH connection, optionally through a ProxyJump host."""
         self.ssh = paramiko.SSHClient()
         self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
+            sock = None
+            if proxy:
+                self._log(f"Connecting via jump host: {proxy}")
+                proxy_ssh = paramiko.SSHClient()
+                proxy_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                proxy_parts = proxy.split("@")
+                proxy_user = proxy_parts[0] if len(proxy_parts) > 1 else username
+                proxy_host = proxy_parts[-1]
+                proxy_ssh.connect(hostname=proxy_host, username=proxy_user, timeout=15,
+                                  allow_agent=True, look_for_keys=True)
+                transport = proxy_ssh.get_transport()
+                sock = transport.open_channel("direct-tcpip", (host, port), ("127.0.0.1", 0))
+                self._proxy_ssh = proxy_ssh
+
             kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
-            if key_path and os.path.isfile(key_path):
-                kwargs["key_filename"] = key_path
-            elif password:
+            if sock:
+                kwargs["sock"] = sock
+            if auth == "password" and password:
                 kwargs["password"] = password
+            elif auth == "agent":
+                kwargs["allow_agent"] = True
+                kwargs["look_for_keys"] = False
             else:
-                kwargs["key_filename"] = os.path.expanduser("~/.ssh/id_rsa")
+                kp = os.path.expanduser(key_path) if key_path else os.path.expanduser("~/.ssh/id_rsa")
+                if os.path.isfile(kp):
+                    kwargs["key_filename"] = kp
+                else:
+                    kwargs["allow_agent"] = True
+                    kwargs["look_for_keys"] = True
             self.ssh.connect(**kwargs)
             self.connected = True
             self._log(f"Connected to {username}@{host}")
@@ -222,7 +290,15 @@ class RemoteGPU:
 
     def _process_slurm(self, args, remote_output):
         """Submit as SLURM job and poll for completion."""
-        script = SLURM_WRAPPER.format(v2x_dir=REMOTE_V2X_DIR, args=args)
+        gres = self.slurm_opts.get("gres", "gpu:1")
+        mem = self.slurm_opts.get("mem", "32G")
+        time_limit = self.slurm_opts.get("time", "02:00:00")
+        partition = self.slurm_opts.get("partition", "")
+        partition_line = f"#SBATCH --partition={partition}" if partition else ""
+        script = SLURM_WRAPPER.format(
+            v2x_dir=REMOTE_V2X_DIR, args=args,
+            gres=gres, mem=mem, time_limit=time_limit, partition_line=partition_line,
+        )
         script_path = f"{REMOTE_V2X_DIR}/data/run_v2x.sh"
 
         self.ssh.exec_command(f"mkdir -p {REMOTE_V2X_DIR}/data")

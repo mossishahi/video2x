@@ -12,7 +12,7 @@ from pathlib import Path
 import webview
 from flask import Flask, jsonify, request
 
-from remote_gpu import RemoteGPU
+from remote_gpu import RemoteGPU, load_gpu_configs, ensure_default_config, DEFAULT_CONFIG_PATH
 
 app = Flask(__name__, static_folder=None)
 
@@ -289,16 +289,31 @@ def reset():
     return jsonify({"ok": True})
 
 
+@app.route("/api/remote/configs")
+def remote_configs():
+    ensure_default_config()
+    configs = load_gpu_configs()
+    return jsonify({"configs": configs, "config_path": DEFAULT_CONFIG_PATH})
+
+
 @app.route("/api/remote/connect", methods=["POST"])
 def remote_connect():
     data = request.json
+    remote_gpu.slurm_opts = data.get("slurm", {})
+    scheduler = data.get("scheduler", "auto")
     ok = remote_gpu.connect(
         host=data["host"],
-        username=data["username"],
+        username=data.get("user") or data.get("username", ""),
         password=data.get("password"),
         key_path=data.get("key_path"),
         port=int(data.get("port", 22)),
+        proxy=data.get("proxy"),
+        auth=data.get("auth", "key"),
     )
+    if ok and scheduler == "slurm":
+        state["remote_has_slurm"] = True
+    elif ok and scheduler == "direct":
+        state["remote_has_slurm"] = False
     return jsonify({"ok": ok, "gpu": state.get("remote_gpu_name", ""), "slurm": state.get("remote_has_slurm", False)})
 
 
@@ -524,6 +539,39 @@ body {
   font-family: 'SF Mono', 'Menlo', monospace;
 }
 .path-input::placeholder { color: var(--text2); }
+.cloud-icon {
+  font-size: 22px; cursor: pointer; padding: 4px 10px;
+  border-radius: 8px; transition: all .2s; margin-left: 8px;
+  color: var(--text2);
+}
+.cloud-icon:hover { background: rgba(255,255,255,.1); color: var(--accent); }
+.cloud-icon.connected { color: var(--success); }
+.cloud-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,.3); z-index: 99;
+}
+.cloud-panel {
+  position: fixed; top: 56px; right: 16px; width: 360px;
+  background: var(--surface); border: 1px solid rgba(255,255,255,.1);
+  border-radius: 12px; padding: 20px; z-index: 100;
+  box-shadow: 0 12px 40px rgba(0,0,0,.5);
+}
+.cloud-panel-title {
+  font-size: 15px; font-weight: 700; margin-bottom: 6px;
+}
+.cloud-gpu-item {
+  padding: 10px 14px; border-radius: 8px; cursor: pointer;
+  border: 1px solid rgba(255,255,255,.08); margin-bottom: 6px;
+  background: rgba(255,255,255,.03); transition: all .15s;
+}
+.cloud-gpu-item:hover { border-color: var(--accent); background: rgba(233,69,96,.05); }
+.cloud-gpu-item .cg-name { font-size: 14px; font-weight: 600; }
+.cloud-gpu-item .cg-host { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.cloud-gpu-item .cg-tag {
+  display: inline-block; font-size: 10px; padding: 2px 8px;
+  background: rgba(255,255,255,.08); border-radius: 4px;
+  color: var(--text2); margin-top: 4px;
+}
 .gpu-gauge-wrap {
   margin-top: 16px; padding: 14px; border-radius: 10px;
   background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
@@ -560,6 +608,25 @@ body {
     <div class="sub">ML-powered video upscaling &amp; frame interpolation</div>
   </div>
   <div class="gpu" id="gpuBadge">Detecting GPU...</div>
+  <div class="cloud-icon" id="cloudIcon" onclick="toggleCloudPanel()" title="Connect to external GPU">&#9729;</div>
+</div>
+
+<div class="cloud-overlay" id="cloudOverlay" style="display:none" onclick="toggleCloudPanel()"></div>
+<div class="cloud-panel" id="cloudPanel" style="display:none">
+  <div class="cloud-panel-title">External GPUs</div>
+  <div id="cloudConfigInfo" style="font-size:11px;color:var(--text2);margin-bottom:12px"></div>
+  <div id="cloudList"></div>
+  <div id="cloudConnected" style="display:none">
+    <div class="badge success" id="cloudBadge" style="font-size:12px;margin-bottom:8px"></div>
+    <button class="btn-cancel" style="font-size:12px;padding:8px" onclick="disconnectRemote()">Disconnect</button>
+  </div>
+  <div id="cloudPasswordPrompt" style="display:none;margin-top:10px">
+    <div class="setting-row">
+      <label>Password</label>
+      <input id="sshPass" type="password" placeholder="Enter password">
+    </div>
+    <button class="btn-primary" style="font-size:13px;padding:8px" onclick="submitPassword()">Connect</button>
+  </div>
 </div>
 
 <div class="main">
@@ -600,42 +667,6 @@ body {
         <label>Output</label>
         <input id="outputPath" type="text" placeholder="Auto-generated"
                style="cursor:text">
-      </div>
-    </div>
-
-    <div>
-      <div class="section-title">Compute</div>
-      <div class="seg-control" style="margin-bottom:10px">
-        <button id="btnLocal" class="active" onclick="setCompute('local')">Local GPU</button>
-        <button id="btnCloud" onclick="setCompute('cloud')">Cloud GPU</button>
-      </div>
-      <div id="cloudPanel" style="display:none">
-        <div id="cloudConnect">
-          <div class="setting-row">
-            <label>Host</label>
-            <input id="sshHost" type="text" placeholder="cluster.university.edu">
-          </div>
-          <div class="setting-row">
-            <label>Username</label>
-            <input id="sshUser" type="text" placeholder="myuser">
-          </div>
-          <div class="setting-row">
-            <label>Auth</label>
-            <select id="sshAuthType" onchange="toggleAuthField()">
-              <option value="key">SSH Key (~/.ssh/id_rsa)</option>
-              <option value="password">Password</option>
-            </select>
-          </div>
-          <div class="setting-row" id="sshPassRow" style="display:none">
-            <label>Password</label>
-            <input id="sshPass" type="password" placeholder="••••••••">
-          </div>
-          <button class="btn-primary" style="font-size:13px;padding:10px" onclick="connectRemote()">Connect</button>
-        </div>
-        <div id="cloudStatus" style="display:none">
-          <div class="badge success" id="cloudBadge" style="margin-bottom:8px;font-size:12px"></div>
-          <button class="btn-cancel" style="font-size:12px;padding:8px" onclick="disconnectRemote()">Disconnect</button>
-        </div>
       </div>
     </div>
 
@@ -944,48 +975,101 @@ function updateGpuBar(name, val) {
   }
 }
 
-function setCompute(mode) {
-  computeMode = mode;
-  document.getElementById('btnLocal').className = mode === 'local' ? 'active' : '';
-  document.getElementById('btnCloud').className = mode === 'cloud' ? 'active' : '';
-  document.getElementById('cloudPanel').style.display = mode === 'cloud' ? 'block' : 'none';
-  renderAction();
-}
+var gpuConfigs = [];
+var pendingConfig = null;
 
-function toggleAuthField() {
-  var v = document.getElementById('sshAuthType').value;
-  document.getElementById('sshPassRow').style.display = v === 'password' ? 'flex' : 'none';
-}
-
-function connectRemote() {
-  var host = document.getElementById('sshHost').value.trim();
-  var user = document.getElementById('sshUser').value.trim();
-  if (!host || !user) { alert('Enter host and username.'); return; }
-
-  var authType = document.getElementById('sshAuthType').value;
-  var body = { host: host, username: user };
-  if (authType === 'password') {
-    body.password = document.getElementById('sshPass').value;
+function toggleCloudPanel() {
+  var panel = document.getElementById('cloudPanel');
+  var overlay = document.getElementById('cloudOverlay');
+  var visible = panel.style.display !== 'none';
+  if (visible) {
+    panel.style.display = 'none';
+    overlay.style.display = 'none';
+  } else {
+    panel.style.display = 'block';
+    overlay.style.display = 'block';
+    loadCloudConfigs();
   }
+}
 
-  document.getElementById('cloudConnect').innerHTML = '<div class="badge warning"><span class="spinner"></span>Connecting...</div>';
+function loadCloudConfigs() {
+  fetch('/api/remote/configs').then(function(r){return r.json()}).then(function(d) {
+    gpuConfigs = d.configs;
+    var el = document.getElementById('cloudList');
+    var info = document.getElementById('cloudConfigInfo');
 
-  fetch('/api/remote/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+    if (remoteConnected) {
+      el.style.display = 'none';
+      document.getElementById('cloudConnected').style.display = 'block';
+      info.innerHTML = '';
+      return;
+    }
+    document.getElementById('cloudConnected').style.display = 'none';
+    el.style.display = 'block';
+
+    if (gpuConfigs.length === 0) {
+      info.innerHTML = 'No GPUs configured. Edit:<br><code style="font-size:10px;color:var(--accent)">' + d.config_path + '</code>';
+      el.innerHTML = '<div style="color:var(--text2);font-size:12px;padding:10px">See gpu_config.example.yaml for the format.</div>';
+      return;
+    }
+
+    info.innerHTML = 'Config: <code style="font-size:10px">' + d.config_path + '</code>';
+    var html = '';
+    for (var i = 0; i < gpuConfigs.length; i++) {
+      var g = gpuConfigs[i];
+      var sched = g.scheduler === 'slurm' ? 'SLURM' : g.scheduler === 'direct' ? 'Direct' : 'Auto';
+      var proxy = g.proxy ? ' \u2192 via ' + g.proxy : '';
+      html += '<div class="cloud-gpu-item" onclick="connectToGpu(' + i + ')">';
+      html += '<div class="cg-name">' + g.name + '</div>';
+      html += '<div class="cg-host">' + g.user + '@' + g.host + ':' + g.port + proxy + '</div>';
+      html += '<span class="cg-tag">' + sched + '</span>';
+      html += '</div>';
+    }
+    el.innerHTML = html;
+  });
+}
+
+function connectToGpu(idx) {
+  var cfg = gpuConfigs[idx];
+  if (cfg.auth === 'password') {
+    pendingConfig = cfg;
+    document.getElementById('cloudPasswordPrompt').style.display = 'block';
+    document.getElementById('cloudList').style.display = 'none';
+    return;
+  }
+  doConnect(cfg);
+}
+
+function submitPassword() {
+  if (!pendingConfig) return;
+  pendingConfig.password = document.getElementById('sshPass').value;
+  document.getElementById('cloudPasswordPrompt').style.display = 'none';
+  doConnect(pendingConfig);
+  pendingConfig = null;
+}
+
+function doConnect(cfg) {
+  document.getElementById('cloudList').style.display = 'none';
+  document.getElementById('cloudConfigInfo').innerHTML = '<div class="badge warning"><span class="spinner"></span>Connecting to ' + cfg.name + '...</div>';
+
+  fetch('/api/remote/connect', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})
     .then(function(r) { return r.json(); })
     .then(function(d) {
       if (d.ok) {
         remoteConnected = true;
+        computeMode = 'cloud';
         remoteSlurm = d.slurm;
-        document.getElementById('cloudConnect').style.display = 'none';
-        document.getElementById('cloudStatus').style.display = 'block';
         var gpu = d.gpu || 'GPU';
-        var slurm = d.slurm ? ' | SLURM' : ' | Direct';
-        document.getElementById('cloudBadge').innerHTML = '\u{1F7E2} ' + gpu + slurm;
+        var sched = d.slurm ? ' | SLURM' : ' | Direct';
+        document.getElementById('cloudConnected').style.display = 'block';
+        document.getElementById('cloudBadge').innerHTML = '\u{1F7E2} ' + cfg.name + ' \u2014 ' + gpu + sched;
+        document.getElementById('cloudConfigInfo').innerHTML = '';
+        document.getElementById('cloudIcon').classList.add('connected');
         document.getElementById('gpuBadge').textContent = '\u{2601}\uFE0F ' + gpu;
         renderAction();
       } else {
-        alert('Connection failed. Check the log for details.');
-        location.reload();
+        document.getElementById('cloudConfigInfo').innerHTML = '<div class="badge error">Connection failed</div>';
+        document.getElementById('cloudList').style.display = 'block';
       }
     });
 }
@@ -993,7 +1077,11 @@ function connectRemote() {
 function disconnectRemote() {
   fetch('/api/remote/disconnect', {method:'POST'});
   remoteConnected = false;
-  location.reload();
+  computeMode = 'local';
+  document.getElementById('cloudIcon').classList.remove('connected');
+  document.getElementById('gpuBadge').textContent = '\u{1F7E2} Apple M3';
+  toggleCloudPanel();
+  renderAction();
 }
 
 function startRemoteProcessing() {

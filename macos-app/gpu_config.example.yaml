@@ -1,0 +1,59 @@
+# Video2X — External GPU Configuration
+#
+# Define one or more remote GPU targets. Video2X will show them
+# in a dropdown when you click the cloud icon.
+#
+# Copy this file to ~/.config/video2x/gpus.yaml and edit it.
+#
+# ─── Authentication ───────────────────────────────────────────
+#   auth: key          → uses ~/.ssh/id_rsa (or key_path if set)
+#   auth: password     → prompts for password on connect
+#   auth: agent        → uses your running SSH agent
+#
+# ─── Scheduling ───────────────────────────────────────────────
+#   scheduler: slurm   → submits via sbatch (connect to login node)
+#   scheduler: direct  → runs video2x directly on the host
+#   scheduler: auto    → detects automatically (default)
+#
+# ─── Jump Hosts ───────────────────────────────────────────────
+#   proxy: user@login.uni.edu   → SSH ProxyJump through this host
+#
+
+gpus:
+  # ── Example 1: University HPC cluster via SLURM ──────────────
+  - name: "Lab A100 Cluster"
+    host: login.hpc.university.edu
+    user: jdoe
+    port: 22
+    auth: key
+    # key_path: ~/.ssh/id_ed25519    # optional, defaults to ~/.ssh/id_rsa
+    scheduler: slurm
+    slurm:
+      partition: gpu               # optional: SLURM partition name
+      gres: "gpu:a100:1"           # optional: GPU resource request
+      mem: "32G"                   # optional: memory request
+      time: "02:00:00"             # optional: time limit
+
+  # ── Example 2: Direct access to a GPU workstation ────────────
+  - name: "Office RTX 4090"
+    host: 192.168.1.50
+    user: admin
+    auth: password                 # will prompt for password
+    scheduler: direct
+
+  # ── Example 3: Cloud GPU behind a jump host ──────────────────
+  - name: "Cloud A100 (via bastion)"
+    host: gpu-node.internal
+    user: ubuntu
+    auth: key
+    key_path: ~/.ssh/cloud_key.pem
+    proxy: ubuntu@bastion.cloud.com
+    scheduler: direct
+
+  # ── Example 4: RunPod / Vast.ai / Lambda ─────────────────────
+  - name: "RunPod RTX 4090"
+    host: ssh.runpod.io
+    user: root
+    port: 22188
+    auth: key
+    scheduler: direct
