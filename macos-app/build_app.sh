@@ -123,10 +123,13 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-echo "[4/5] .app bundle created at: $APP_BUNDLE"
+echo "[4/6] Ad-hoc signing .app bundle..."
+codesign --force --deep --sign - "$APP_BUNDLE"
 
-# Step 4: Create DMG
-echo "[5/5] Creating DMG..."
+echo "[5/6] .app bundle created at: $APP_BUNDLE"
+
+# Step 5: Create DMG
+echo "[6/6] Creating DMG..."
 DMG_PATH="$BUILD_DIR/$DMG_NAME"
 DMG_TMP="$BUILD_DIR/dmg_tmp"
 mkdir -p "$DMG_TMP"
