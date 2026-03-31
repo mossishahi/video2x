@@ -209,34 +209,18 @@ class RemoteGPU:
                 proxy_kw.update(_auth_kwargs(auth, password, key_path))
                 proxy_ssh.connect(**proxy_kw)
                 self._proxy_ssh = proxy_ssh
-                self._log(f"Jump host connected. Hopping to {host}...")
+                self._log(f"Jump host connected.")
 
-                # Hop via ssh command on the login node (uses its internal keys)
-                hop_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port} {username}@{host}"
-                transport = proxy_ssh.get_transport()
-                chan = transport.open_session()
-                chan.get_pty()
-                chan.exec_command(hop_cmd)
+                # Verify the hop works
+                ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port} {username}@{host}"
+                _, stdout, stderr = proxy_ssh.exec_command(f"{ssh_prefix} 'echo HOP_OK'", timeout=15)
+                out = stdout.read().decode().strip()
+                if "HOP_OK" not in out:
+                    err = stderr.read().decode().strip()
+                    raise Exception(f"Cannot reach {host} from {proxy_host}: {err or out}")
 
-                # Wait for shell prompt or auth on the internal hop
-                import select
-                buf = ""
-                deadline = time.time() + 15
-                while time.time() < deadline:
-                    if chan.recv_ready():
-                        chunk = chan.recv(4096).decode("utf-8", errors="replace")
-                        buf += chunk
-                        lower = buf.lower()
-                        if "password:" in lower or "password for" in lower:
-                            chan.send(password + "\n")
-                            buf = ""
-                        elif "$" in buf[-20:] or ">" in buf[-20:] or "#" in buf[-20:] or "last login" in lower:
-                            break
-                    else:
-                        time.sleep(0.2)
-
-                # Wrap the channel as an SSHClient-like object
-                self.ssh = _ProxyShell(chan)
+                # Use a relay that runs commands on the target via the proxy
+                self.ssh = _ProxyRelay(proxy_ssh, ssh_prefix)
                 self._log(f"Connected to {host} via {proxy_host}")
             else:
                 kwargs = {"hostname": host, "port": port, "username": username, "timeout": 15}
@@ -246,16 +230,17 @@ class RemoteGPU:
             self._log(f"Connected to {username}@{host}")
             time.sleep(1)
 
+            def _read(stdout):
+                raw = stdout.read()
+                return raw.decode().strip() if isinstance(raw, bytes) else raw.strip()
+
             try:
                 _, stdout, _ = self.ssh.exec_command("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1")
-                raw = stdout.read()
-                gpu_name = raw if isinstance(raw, str) else raw.decode()
-                gpu_name = gpu_name.strip()
+                gpu_name = _read(stdout)
                 if gpu_name:
                     self._log(f"Remote GPU: {gpu_name}")
                     self.state["remote_gpu_name"] = gpu_name
                 else:
-                    self._log("Warning: No NVIDIA GPU detected on remote host.")
                     self.state["remote_gpu_name"] = "Unknown"
             except Exception as e:
                 self._log(f"GPU detection skipped: {e}")
@@ -263,9 +248,7 @@ class RemoteGPU:
 
             try:
                 _, stdout, _ = self.ssh.exec_command("command -v srun sbatch 2>/dev/null && echo HAS_SLURM || echo NO_SLURM")
-                raw = stdout.read()
-                out = raw if isinstance(raw, str) else raw.decode()
-                has_slurm = "HAS_SLURM" in out
+                has_slurm = "HAS_SLURM" in _read(stdout)
                 self.state["remote_has_slurm"] = has_slurm
                 self._log(f"SLURM: {'available' if has_slurm else 'not found (will run directly)'}")
             except Exception as e:
@@ -316,7 +299,7 @@ class RemoteGPU:
         size_mb = os.path.getsize(local_path) / 1024 / 1024
         self._log(f"Uploading {filename} ({size_mb:.1f} MB)...")
 
-        if isinstance(self.ssh, _ProxyShell):
+        if isinstance(self.ssh, _ProxyRelay):
             self._upload_via_proxy(local_path, f"{remote_dir}/{filename}")
         else:
             with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
@@ -466,7 +449,7 @@ class RemoteGPU:
         local_path = os.path.join(local_dir, filename)
         self._log(f"Downloading {filename}...")
 
-        if isinstance(self.ssh, _ProxyShell):
+        if isinstance(self.ssh, _ProxyRelay):
             self._download_via_proxy(remote_path, local_path)
         else:
             with SCPClient(self.ssh.get_transport(), progress=self._scp_progress) as scp_client:
@@ -494,72 +477,24 @@ class RemoteGPU:
         self._cancel = True
 
 
-class _ProxyShell:
-    """Wraps an interactive SSH channel (hop via login node) to behave like paramiko.SSHClient."""
+class _ProxyRelay:
+    """Runs commands on a remote target by relaying through a jump host via ssh."""
 
-    def __init__(self, channel):
-        self._chan = channel
-        self._lock = threading.Lock()
+    def __init__(self, proxy_ssh, ssh_prefix):
+        self._proxy = proxy_ssh
+        self._prefix = ssh_prefix
 
     def exec_command(self, cmd, get_pty=False, timeout=None):
-        """Execute a command and return (stdin, stdout, stderr) file-like objects."""
-        import io, select as _sel
-
-        marker = f"__EXIT_{id(cmd)}__"
-        full_cmd = f"{cmd}; echo {marker}$?\n"
-
-        with self._lock:
-            # Drain any leftover output
-            while self._chan.recv_ready():
-                self._chan.recv(4096)
-
-            self._chan.send(full_cmd)
-            output = ""
-            deadline = time.time() + (timeout or 3600)
-
-            while time.time() < deadline:
-                if self._chan.recv_ready():
-                    chunk = self._chan.recv(65536).decode("utf-8", errors="replace")
-                    output += chunk
-                    if marker in output:
-                        break
-                else:
-                    time.sleep(0.1)
-
-        # Parse output: strip the command echo and marker
-        lines = output.split("\n")
-        result_lines = []
-        capture = False
-        exit_code = 0
-        for line in lines:
-            if marker in line:
-                try:
-                    exit_code = int(line.split(marker)[-1].strip())
-                except ValueError:
-                    pass
-                break
-            if capture:
-                result_lines.append(line)
-            elif full_cmd.strip()[:40] in line or cmd.strip()[:40] in line:
-                capture = True
-
-        stdout = io.StringIO("\n".join(result_lines))
-        stderr = io.StringIO("")
-        stdin = io.StringIO("")
-        return stdin, stdout, stderr
-
-    def open_sftp(self):
-        raise NotImplementedError("SFTP not available through proxy hop; using scp command instead.")
+        """Execute a command on the target node via the proxy."""
+        escaped = cmd.replace("'", "'\\''")
+        relay_cmd = f"{self._prefix} '{escaped}'"
+        return self._proxy.exec_command(relay_cmd, timeout=timeout)
 
     def get_transport(self):
-        return self._chan.get_transport()
+        return self._proxy.get_transport()
 
     def close(self):
-        try:
-            self._chan.send("exit\n")
-            self._chan.close()
-        except Exception:
-            pass
+        pass
 
 
 def _escape(s):
