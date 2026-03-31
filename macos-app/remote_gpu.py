@@ -9,7 +9,7 @@ import paramiko
 import yaml
 from scp import SCPClient
 
-REMOTE_V2X_DIR = "~/video2x_remote"
+REMOTE_V2X_DIR = "~/.local/share/venhance"
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/video2x/gpus.yaml")
 EXAMPLE_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gpu_config.example.yaml")
 
@@ -90,7 +90,7 @@ INSTALL_SCRIPT = r"""
 set -e
 V2X_DIR="{v2x_dir}"
 
-if [ -f "$V2X_DIR/build/video2x-install/bin/video2x" ]; then
+if [ -f "$V2X_DIR/build/venhance-install/bin/venhance" ]; then
     echo "INSTALL_OK"
     exit 0
 fi
@@ -116,25 +116,27 @@ module load cuda 2>/dev/null || true
 # Clone if needed
 if [ ! -f "$V2X_DIR/CMakeLists.txt" ]; then
     git clone --depth 1 --recurse-submodules --shallow-submodules \
-        https://github.com/k4yt3x/video2x.git "$V2X_DIR"
+        https://github.com/k4yt3x/video2x.git "$V2X_DIR" 2>/dev/null
 fi
 
 cd "$V2X_DIR"
 
 cmake -G Ninja -S . -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=build/video2x-install \
+    -DCMAKE_INSTALL_PREFIX=build/venhance-install \
     -DVIDEO2X_USE_EXTERNAL_NCNN=OFF \
     -DVIDEO2X_USE_EXTERNAL_SPDLOG=OFF \
     -DVIDEO2X_USE_EXTERNAL_BOOST=OFF 2>&1
 
 cmake --build build --config Release --parallel $(nproc) --target install 2>&1
 
+mv build/venhance-install/bin/video2x build/venhance-install/bin/venhance 2>/dev/null
+
 echo "INSTALL_OK"
 """
 
 SLURM_WRAPPER = r"""#!/bin/bash
-#SBATCH --job-name=video2x
+#SBATCH --job-name=vproc
 #SBATCH --gres={gres}
 #SBATCH --mem={mem}
 #SBATCH --time={time_limit}
@@ -144,10 +146,10 @@ SLURM_WRAPPER = r"""#!/bin/bash
 module load cuda 2>/dev/null || true
 module load vulkan 2>/dev/null || true
 
-V2X="{v2x_dir}/build/video2x-install/bin/video2x"
+V2X="{v2x_dir}/build/venhance-install/bin/venhance"
 export LD_LIBRARY_PATH="{v2x_dir}/build:$LD_LIBRARY_PATH"
 
-cd "{v2x_dir}/build/video2x-install/share/video2x"
+cd "{v2x_dir}/build/venhance-install/share/video2x"
 
 $V2X {args}
 
@@ -260,18 +262,18 @@ class RemoteGPU:
         self.connected = False
 
     def install_video2x(self):
-        """Install video2x on the remote machine if not present."""
-        self._log("Checking remote video2x installation...")
+        """Install processing engine on the remote machine if not present."""
+        self._log("Checking remote installation...")
         script = INSTALL_SCRIPT.format(v2x_dir=REMOTE_V2X_DIR)
         _, stdout, stderr = self.ssh.exec_command(f"bash -l -c '{_escape(script)}'", get_pty=True)
 
         for line in stdout:
             line = line.strip()
             if line == "INSTALL_OK":
-                self._log("video2x is ready on remote.")
+                self._log("Processing engine ready on remote.")
                 return True
             elif line == "INSTALL_STARTED":
-                self._log("Installing video2x on remote (this takes a few minutes on first run)...")
+                self._log("Installing on remote (this takes a few minutes on first run)...")
             elif line.startswith("MISSING_DEP:"):
                 self._log(f"  Warning: {line.split(':')[1]} not found, trying module load...")
             elif line:
@@ -316,12 +318,12 @@ class RemoteGPU:
             return self._process_direct(full_args, remote_output)
 
     def _process_direct(self, args, remote_output):
-        """Run video2x directly on the remote node."""
-        v2x_bin = f"{REMOTE_V2X_DIR}/build/video2x-install/bin/video2x"
-        models_dir = f"{REMOTE_V2X_DIR}/build/video2x-install/share/video2x"
+        """Run processing directly on the remote node."""
+        v2x_bin = f"{REMOTE_V2X_DIR}/build/venhance-install/bin/venhance"
+        models_dir = f"{REMOTE_V2X_DIR}/build/venhance-install/share/video2x"
 
         cmd = f"cd {models_dir} && LD_LIBRARY_PATH={REMOTE_V2X_DIR}/build:$LD_LIBRARY_PATH {v2x_bin} {args}"
-        self._log(f"Running: video2x {args.split('-o')[0].strip()} ...")
+        self._log(f"Starting remote processing...")
 
         _, stdout, _ = self.ssh.exec_command(f"bash -l -c '{_escape(cmd)}'", get_pty=True)
 
@@ -356,7 +358,7 @@ class RemoteGPU:
             v2x_dir=REMOTE_V2X_DIR, args=args,
             gres=gres, mem=mem, time_limit=time_limit, partition_line=partition_line,
         )
-        script_path = f"{REMOTE_V2X_DIR}/data/run_v2x.sh"
+        script_path = f"{REMOTE_V2X_DIR}/data/run_proc.sh"
 
         self.ssh.exec_command(f"mkdir -p {REMOTE_V2X_DIR}/data")
         time.sleep(0.3)
