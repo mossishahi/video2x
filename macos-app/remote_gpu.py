@@ -446,17 +446,20 @@ class RemoteGPU:
             clean = line.replace("\x1b[K", "").replace("\r", "").strip()
             if not clean:
                 continue
-            m = PROGRESS_RE.search(clean)
-            if m:
-                self.state["frame"] = int(m.group(1))
-                self.state["total"] = int(m.group(2))
-                self.state["fps"] = float(m.group(4))
-                self.state["elapsed"] = m.group(5)
-                self.state["remaining"] = m.group(6).strip()
-                if self.state["total"] > 0:
-                    self.state["progress"] = self.state["frame"] / self.state["total"]
-            else:
-                self._log(clean)
+            if "frame=" in clean and "fps=" in clean:
+                m = PROGRESS_RE.search(clean)
+                if m:
+                    self.state["frame"] = int(m.group(1))
+                    self.state["total"] = int(m.group(2))
+                    self.state["fps"] = float(m.group(4))
+                    self.state["elapsed"] = m.group(5)
+                    self.state["remaining"] = m.group(6).strip()
+                    if self.state["total"] > 0:
+                        self.state["progress"] = self.state["frame"] / self.state["total"]
+                continue
+            if clean.startswith("[K") or clean.startswith("\x1b") or clean.startswith("+"):
+                continue
+            self._log(clean)
 
         return remote_output
 

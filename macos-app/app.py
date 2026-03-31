@@ -221,19 +221,22 @@ def run_local_job(job):
             clean = line.replace("\x1b[K", "").replace("\r", "").strip()
             if not clean:
                 continue
-            m = PROGRESS_RE.search(clean)
-            if m:
-                job["frame"] = int(m.group(1))
-                job["total"] = int(m.group(2))
-                job["fps"] = float(m.group(4))
-                job["elapsed"] = m.group(5)
-                job["remaining"] = m.group(6).strip()
-                if job["total"] > 0:
-                    job["progress"] = job["frame"] / job["total"]
-            else:
-                job["log"] += clean + "\n"
-                if len(job["log"]) > 50000:
-                    job["log"] = job["log"][-40000:]
+            if "frame=" in clean and "fps=" in clean:
+                m = PROGRESS_RE.search(clean)
+                if m:
+                    job["frame"] = int(m.group(1))
+                    job["total"] = int(m.group(2))
+                    job["fps"] = float(m.group(4))
+                    job["elapsed"] = m.group(5)
+                    job["remaining"] = m.group(6).strip()
+                    if job["total"] > 0:
+                        job["progress"] = job["frame"] / job["total"]
+                continue
+            if clean.startswith("[K") or clean.startswith("\x1b"):
+                continue
+            job["log"] += clean + "\n"
+            if len(job["log"]) > 50000:
+                job["log"] = job["log"][-40000:]
 
         proc.wait()
         if proc.returncode == 0:
@@ -520,6 +523,22 @@ def get_gpus():
     for i, c in enumerate(load_gpu_configs()):
         gpu_list.append({"id": str(i), "name": c.get("name", "Remote GPU " + str(i))})
     return jsonify(gpus=gpu_list)
+
+
+@app.route("/api/jobs/<job_id>/log")
+def get_job_log(job_id):
+    job = jobs.get(job_id)
+    log_text = job["log"] if job else "Job not found"
+    name = job["input_name"] if job else "Unknown"
+    return f"""<!DOCTYPE html><html><head><title>Log: {name}</title>
+<style>body{{background:#1a1a2e;color:#aab;font-family:SF Mono,Menlo,monospace;font-size:12px;padding:16px;white-space:pre-wrap;word-break:break-all;line-height:1.6;margin:0}}
+.bar{{position:fixed;top:0;left:0;right:0;padding:8px 16px;background:#16213e;border-bottom:1px solid rgba(255,255,255,.1);display:flex;gap:10px;align-items:center;z-index:10}}
+.bar button{{background:#e94560;color:#fff;border:none;padding:5px 14px;border-radius:6px;cursor:pointer;font-size:12px}}
+.bar .back{{background:rgba(255,255,255,.1);color:#eee}}
+.bar span{{font-size:13px;font-weight:600;color:#eee}}
+pre{{margin-top:44px;user-select:text;-webkit-user-select:text}}</style></head><body>
+<div class="bar"><button class="back" onclick="window.location='/'">&#8592; Back</button><span>Log: {name}</span><button onclick="navigator.clipboard.writeText(document.getElementById('l').textContent)">Copy</button></div>
+<pre id="l">{log_text}</pre></body></html>"""
 
 
 @app.route("/api/open-folder", methods=["POST"])
@@ -1483,19 +1502,7 @@ function switchTab(tab) {
 }
 
 function openLogWindow(jobId) {
-  var job = null;
-  for (var i = 0; i < jobsData.length; i++) {
-    if (jobsData[i].id === jobId) { job = jobsData[i]; break; }
-  }
-  if (!job || !job.log) return;
-  var w = window.open('', 'log_' + jobId, 'width=800,height=500');
-  if (!w) return;
-  w.document.write('<html><head><title>Log: ' + escH(job.input_name) + '</title>');
-  w.document.write('<style>body{background:#1a1a2e;color:#aab;font-family:SF Mono,Menlo,monospace;font-size:12px;padding:16px;white-space:pre-wrap;word-break:break-all;line-height:1.6}');
-  w.document.write('.copy{position:fixed;top:10px;right:10px;background:#e94560;color:#fff;border:none;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px}</style></head><body>');
-  w.document.write('<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById(\'l\').textContent)">Copy</button>');
-  w.document.write('<pre id="l">' + escH(job.log) + '</pre></body></html>');
-  w.document.close();
+  window.location.href = '/api/jobs/' + jobId + '/log';
 }
 
 function openOutputFolder(jobId) {
