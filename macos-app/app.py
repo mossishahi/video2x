@@ -1088,6 +1088,7 @@ var gpuList = [];
 var gpuConfigs = [];
 var addingType = '';
 var editingIndex = -1;
+var sessionPasswords = {};
 var lastJobIds = '';
 var lastJobStates = {};
 var expandedLogs = {};
@@ -1461,27 +1462,30 @@ function startJob(jobId) {
   var sel = document.getElementById('gpu-' + jobId);
   if (sel) gpu = sel.value;
 
-  var needsPassword = false;
   if (gpu !== 'local') {
-    for (var i = 0; i < gpuConfigs.length; i++) {
-      if (String(gpuConfigs[i].id) === String(gpu) && gpuConfigs[i].auth === 'password') {
-        needsPassword = true;
-        break;
-      }
+    var gpuName = '';
+    for (var i = 0; i < gpuList.length; i++) {
+      if (gpuList[i].id === gpu) { gpuName = gpuList[i].name; break; }
     }
+    var cachedKey = gpu + '_pw';
+    var pw = sessionPasswords[cachedKey] || '';
+    if (!pw) {
+      pw = prompt('Enter SSH password for ' + (gpuName || 'remote GPU') + ':');
+      if (pw === null) return;
+      sessionPasswords[cachedKey] = pw;
+    }
+    fetch('/api/jobs/' + jobId + '/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({gpu: gpu, password: pw})
+    });
+  } else {
+    fetch('/api/jobs/' + jobId + '/start', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({gpu: gpu})
+    });
   }
-
-  var pw = '';
-  if (needsPassword) {
-    pw = prompt('Enter SSH password for ' + (gpuConfigs[parseInt(gpu)] ? gpuConfigs[parseInt(gpu)].name : 'remote GPU') + ':');
-    if (pw === null) return;
-  }
-
-  fetch('/api/jobs/' + jobId + '/start', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({gpu: gpu, password: pw})
-  });
   lastJobIds = '';
 }
 
