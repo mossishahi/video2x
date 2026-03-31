@@ -163,14 +163,18 @@ SLURM_WRAPPER = r"""#!/bin/bash
 {extra_sbatch}
 #SBATCH --output={v2x_dir}/data/job_%j.log
 
+set -x
 module load cuda 2>/dev/null || true
 module load vulkan 2>/dev/null || true
 
-export LD_LIBRARY_PATH="{v2x_dir}/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
-cd "{v2x_dir}/squashfs-root/usr/share/video2x"
-V2X="{v2x_dir}/squashfs-root/usr/bin/video2x"
+V2X_DIR="{v2x_dir}"
+export LD_LIBRARY_PATH="$V2X_DIR/squashfs-root/usr/lib:$LD_LIBRARY_PATH"
+cd "$V2X_DIR/squashfs-root/usr/share/video2x"
 
-$V2X {args}
+echo "Running on $(hostname) with GPU:"
+nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "No GPU found"
+
+"$V2X_DIR/squashfs-root/usr/bin/video2x" {args}
 
 echo "V2X_EXIT_CODE:$?"
 """
@@ -465,12 +469,14 @@ class RemoteGPU:
         script_path = f"{REMOTE_V2X_DIR}/data/run_proc.sh"
 
         self.ssh.exec_command(f"mkdir -p {REMOTE_V2X_DIR}/data")
-        time.sleep(0.3)
+        time.sleep(0.5)
 
-        sftp = self.ssh.open_sftp()
-        with sftp.open(os.path.expanduser(script_path.replace("~", ".")), "w") as f:
-            f.write(script)
-        sftp.close()
+        # Write the script via echo to avoid SFTP issues
+        escaped_script = script.replace("'", "'\\''")
+        self.ssh.exec_command(f"echo '{escaped_script}' > {script_path}")
+        time.sleep(0.3)
+        self.ssh.exec_command(f"chmod +x {script_path}")
+        time.sleep(0.2)
 
         self._log("Submitting SLURM job...")
         _, stdout, _ = self.ssh.exec_command(f"sbatch {script_path}")
@@ -488,16 +494,15 @@ class RemoteGPU:
         last_size = 0
 
         while not self._cancel:
-            time.sleep(3)
+            time.sleep(5)
             _, stdout, _ = self.ssh.exec_command(f"squeue -j {job_id} -h -o %T 2>/dev/null")
             status = stdout.read().decode().strip()
 
-            if not status or status in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"):
-                break
-            elif status == "PENDING":
+            if status == "PENDING":
                 self._log(f"Job {job_id}: waiting in queue...")
                 continue
 
+            # Read the job log for progress
             _, stdout, _ = self.ssh.exec_command(f"tail -c +{last_size} {log_path} 2>/dev/null")
             new_data = stdout.read().decode()
             last_size += len(new_data)
@@ -517,8 +522,29 @@ class RemoteGPU:
                         self.state["progress"] = self.state["frame"] / self.state["total"]
                 elif "V2X_EXIT_CODE:0" in clean:
                     self._log("Remote processing complete!")
+                elif "V2X_EXIT_CODE:" in clean:
+                    self._log(f"Processing failed: {clean}")
                 else:
                     self._log(clean)
+
+            # Check if job is done
+            if not status or status in ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"):
+                break
+
+        # Dump full job log
+        self._log(f"\n--- SLURM job {job_id} finished (status: {status or 'completed'}) ---")
+        _, stdout, _ = self.ssh.exec_command(f"cat {log_path} 2>/dev/null | tail -30")
+        tail = stdout.read().decode().strip()
+        if tail:
+            self._log(tail)
+
+        # Verify output exists
+        _, stdout, _ = self.ssh.exec_command(f"ls -la {remote_output} 2>&1")
+        ls_out = stdout.read().decode().strip()
+        if "No such file" in ls_out:
+            self._log(f"\nOutput file not found: {remote_output}")
+            self._log("The SLURM job may have failed. Check the log above for errors.")
+            return None
 
         return remote_output
 
